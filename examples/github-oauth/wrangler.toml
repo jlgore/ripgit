@@ -29,3 +29,9 @@ GITHUB_CLIENT_ID = "<your-app-id>"
 
 # Random secret for signing session cookies (any 32+ char string):
 #   wrangler secret put SESSION_SECRET
+
+# Audience that GitHub Actions OIDC tokens must carry when exchanging for a
+# mirror token. Pin this to THIS deployment's URL. GitHub's default audience is
+# the repo owner's URL, which every service that owner runs shares — a token
+# minted for one of them would otherwise be replayable here.
+OIDC_AUDIENCE = "https://your-worker.workers.dev"

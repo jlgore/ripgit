@@ -11,6 +11,9 @@ export interface ActorProps {
   ownerActorId?: string;    // agents only: owning user's actorId
   ownerActorName?: string;  // agents only: owning user's GitHub username (used for ownership checks)
   scopes: string[];
+  // Mirror agents only: the single "owner/repo" path this credential may touch.
+  // Enforced on every proxied request, since ripgit's own check is owner-wide.
+  repoScope?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -24,6 +27,9 @@ export interface Env {
   GITHUB_CLIENT_SECRET: string;
   // Random secret for signing session cookies — set with: wrangler secret put SESSION_SECRET
   SESSION_SECRET: string;
+  // Audience that GitHub Actions OIDC tokens must carry. Pin to this
+  // deployment's URL so tokens minted for other services cannot be replayed.
+  OIDC_AUDIENCE: string;
   // Injected by workers-oauth-provider for defaultHandler and apiHandler calls
   OAUTH_PROVIDER: OAuthHelpers;
 }

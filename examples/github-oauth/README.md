@@ -8,10 +8,65 @@ This example Worker sits in front of ripgit, handles GitHub OAuth, issues browse
 - `GET /settings` - token management page after sign-in plus text mode for curl/agents
 - `GET /login` / `GET /logout` - browser login/logout flow
 - `GET /oauth/authorize` / `POST /oauth/token` - OAuth provider flow for programmatic clients
+- `POST /oidc/github/exchange` - trade a GitHub Actions OIDC token for a short-lived, repo-scoped push token
 - `POST /settings/tokens` - create a long-lived token
 - `POST /settings/tokens/:id/revoke` - revoke a long-lived token
 
 Everything else is forwarded to ripgit.
+
+## Mirroring From GitHub Without A Long-Lived Secret
+
+A GitHub Actions workflow can push a mirror into ripgit using an OIDC token that
+Actions signs at runtime. Nothing long-lived is stored in GitHub secrets, and a
+minted token lives ten minutes and may write to exactly one repo.
+
+```
+Actions (id-token: write) --OIDC JWT--> POST /oidc/github/exchange
+                                          verify signature against GitHub JWKS
+                                          check iss / aud / exp / jti
+                                          look up the mirror allowlist
+                                        <--short-lived token-- git push
+```
+
+`POST /oidc/github/exchange` takes `{"subject_token": "<JWT>"}` and returns
+`{"access_token", "expires_in", "target"}`. Use the token as a bearer header or
+as the password of an HTTPS git remote.
+
+A copy-paste workflow lives in `examples/github-actions-mirror/mirror.yml`.
+
+### Enrolling A Repo
+
+Which GitHub repo may mirror into which ripgit repo is an explicit allowlist,
+not a rule. GitHub repos live under several owners — a personal account and any
+number of orgs — that do not map onto ripgit owners by any rule worth guessing
+at, and declaring the mapping also means a workflow can only ever write to the
+one repo an admin chose for it.
+
+```bash
+wrangler kv key put --binding OAUTH_KV "mirror:jlgore/ripgit" \
+  '{"target":"jlgore/ripgit","refs":["refs/heads/main"]}'
+```
+
+- `target` — the `owner/repo` path in ripgit this workflow may push to.
+- `refs` — optional; if set, only these refs may trigger an exchange.
+
+The key is lowercased on lookup. Remove the key to revoke mirroring; already
+minted tokens still expire on their own within ten minutes.
+
+### Why The Audience Must Be Pinned
+
+`OIDC_AUDIENCE` must be set to this deployment's URL, and the workflow must
+request that same audience. GitHub's default audience is the repository owner's
+URL, which is shared with every other service that owner runs — without pinning,
+a token minted for any of them could be replayed here. The exchange endpoint
+refuses to run at all when `OIDC_AUDIENCE` is unset rather than falling back.
+
+### Scope Enforcement
+
+ripgit's own ownership check is owner-wide: an actor named `jlgore` may write to
+any repo under `/jlgore/`. Mirror tokens carry a `repoScope`, and the auth worker
+rejects any proxied request whose path does not match it, so a workflow in one
+repo cannot push to a sibling.
 
 ## Required Bindings And Secrets
 
@@ -20,6 +75,7 @@ Set these in `wrangler.toml` or as Worker secrets:
 - `GITHUB_CLIENT_ID` - GitHub OAuth App client ID (`[vars]`)
 - `GITHUB_CLIENT_SECRET` - GitHub OAuth App client secret (`wrangler secret put GITHUB_CLIENT_SECRET`)
 - `SESSION_SECRET` - random 32+ character secret for signing browser sessions (`wrangler secret put SESSION_SECRET`)
+- `OIDC_AUDIENCE` - this deployment's URL, required for GitHub Actions mirroring (`[vars]`)
 - `OAUTH_KV` - KV namespace used for OAuth state, issued tokens, and token indexes
 - `RIPGIT` - Service Binding that points at the main ripgit Worker
 

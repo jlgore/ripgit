@@ -1,0 +1,73 @@
+# Mirror a GitHub repo into ripgit on every push, with no long-lived secret.
+#
+# The workflow asks Actions for a signed OIDC token describing itself, trades it
+# at the auth worker for a token that lives ten minutes and may write to exactly
+# one ripgit repo, and pushes. Nothing is stored in GitHub secrets.
+#
+# Enroll the repo first (see examples/github-oauth/README.md):
+#   wrangler kv key put --binding OAUTH_KV "mirror:owner/repo" \
+#     '{"target":"owner/repo","refs":["refs/heads/main"]}'
+
+name: Mirror to ripgit
+
+on:
+  push:
+    branches: [main]
+
+# id-token: write is what lets the job request an OIDC token at all.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mirror-ripgit
+  cancel-in-progress: false
+
+env:
+  RIPGIT_HOST: https://your-worker.workers.dev
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history — a mirror push must carry every object.
+          fetch-depth: 0
+
+      - name: Exchange OIDC token for a ripgit mirror token
+        id: auth
+        run: |
+          set -euo pipefail
+
+          # The audience must match OIDC_AUDIENCE on the worker.
+          OIDC=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RIPGIT_HOST" \
+            | jq -r '.value')
+
+          TOKEN=$(curl -sS -X POST "$RIPGIT_HOST/oidc/github/exchange" \
+            -H 'Content-Type: application/json' \
+            -d "{\"subject_token\":\"$OIDC\"}" \
+            | jq -r '.access_token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "::error::OIDC exchange failed — is this repo enrolled?"
+            exit 1
+          fi
+
+          # Keep the token out of the log; ::add-mask:: also covers accidents.
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Push mirror
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Credentials go in a header, not the URL, so they never reach
+          # .git/config or the process list of another step.
+          git -c http.extraHeader="Authorization: Bearer $TOKEN" \
+            push --prune --force \
+            "$RIPGIT_HOST/$GITHUB_REPOSITORY" \
+            '+refs/remotes/origin/*:refs/heads/*' '+refs/tags/*:refs/tags/*'

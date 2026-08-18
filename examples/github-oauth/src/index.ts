@@ -37,6 +37,11 @@ import {
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { exchangeCode, fetchGitHubUser, githubAuthorizeUrl } from "./github";
 import type { ActorProps, Env } from "./types";
+import {
+  lookupMirrorGrant,
+  OidcError,
+  verifyGitHubOidcToken,
+} from "./oidc";
 
 const ALL_SCOPES = [
   "repo:read",
@@ -177,6 +182,9 @@ async function mainHandler(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/oauth/authorize")
     return handleAuthorize(request, env);
   if (url.pathname === "/oauth/callback") return handleCallback(request, env);
+  if (url.pathname === "/oidc/github/exchange" && request.method === "POST") {
+    return handleOidcExchange(request, env);
+  }
 
   if (url.pathname === "/settings") {
     if (!actor) {
@@ -1065,6 +1073,146 @@ async function resolveActor(
 }
 
 // ---------------------------------------------------------------------------
+// GitHub Actions OIDC exchange
+// ---------------------------------------------------------------------------
+
+/** Lifetime of a minted mirror token — long enough to push, short enough to
+ *  be worthless by the time it could leak out of a run log. */
+const MIRROR_TOKEN_TTL = 600;
+
+/**
+ * POST /oidc/github/exchange
+ *
+ * Body: {"subject_token": "<GitHub Actions OIDC JWT>"}
+ * Returns a short-lived bearer token usable as the password of a git remote.
+ *
+ * The caller proves which repository it is by presenting a token GitHub signed;
+ * it does not get to say so itself. Which ripgit repo that maps to is decided
+ * here, from the admin-managed allowlist, never from the request.
+ */
+async function handleOidcExchange(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  let subjectToken: string | undefined;
+  const contentType = request.headers.get("Content-Type") ?? "";
+  try {
+    if (contentType.includes("application/json")) {
+      subjectToken = ((await request.json()) as { subject_token?: string })
+        .subject_token;
+    } else {
+      subjectToken =
+        (await request.formData()).get("subject_token")?.toString() ??
+        undefined;
+    }
+  } catch {
+    return oidcError("invalid_request", "could not parse request body", 400);
+  }
+
+  if (!subjectToken) {
+    return oidcError("invalid_request", "subject_token is required", 400);
+  }
+  if (!env.OIDC_AUDIENCE) {
+    // Refuse rather than fall back to GitHub's default audience, which is
+    // shared across every service the owner runs.
+    return oidcError(
+      "server_error",
+      "OIDC_AUDIENCE is not configured on this deployment",
+      500,
+    );
+  }
+
+  try {
+    const claims = await verifyGitHubOidcToken(
+      subjectToken,
+      env.OIDC_AUDIENCE,
+      env.OAUTH_KV,
+    );
+
+    const grant = await lookupMirrorGrant(env.OAUTH_KV, claims.repository);
+    if (!grant) {
+      return oidcError(
+        "access_denied",
+        `${claims.repository} is not enrolled for mirroring`,
+        403,
+      );
+    }
+    if (grant.refs && (!claims.ref || !grant.refs.includes(claims.ref))) {
+      return oidcError(
+        "access_denied",
+        `ref ${claims.ref ?? "(none)"} may not mirror ${claims.repository}`,
+        403,
+      );
+    }
+
+    const [targetOwner] = grant.target.split("/");
+    const token = generateToken();
+    const actor: ActorProps = {
+      actorId: `agent:gha:${claims.repository}`,
+      actorName: `github-actions:${claims.repository}`,
+      actorKind: "agent",
+      // Ownership in ripgit is checked against the *target* owner, which is the
+      // allowlist's decision — not against the GitHub owner in the token.
+      ownerActorName: targetOwner,
+      scopes: ["push"],
+      repoScope: grant.target,
+    };
+    await env.OAUTH_KV.put(`agent:${token}`, JSON.stringify(actor), {
+      expirationTtl: MIRROR_TOKEN_TTL,
+    });
+
+    return Response.json({
+      access_token: token,
+      token_type: "Bearer",
+      expires_in: MIRROR_TOKEN_TTL,
+      target: grant.target,
+    });
+  } catch (err) {
+    if (err instanceof OidcError) {
+      return oidcError("invalid_grant", err.message, 401);
+    }
+    throw err;
+  }
+}
+
+function oidcError(
+  error: string,
+  description: string,
+  status: number,
+): Response {
+  return Response.json({ error, error_description: description }, { status });
+}
+
+/**
+ * Enforce a mirror token's repo scope.
+ *
+ * ripgit's ownership check is owner-wide, so without this a workflow in one
+ * repo could push to any repo under the same owner. Returns null when allowed.
+ */
+function denyOutOfScope(
+  request: Request,
+  actor: ActorProps | null,
+): Response | null {
+  if (!actor?.repoScope) return null;
+  const parts = new URL(request.url).pathname
+    .replace(/^\/+/, "")
+    .split("/");
+  if (parts.length < 2 || !parts[0] || !parts[1]) {
+    return new Response("Forbidden: token is scoped to a single repository", {
+      status: 403,
+    });
+  }
+  const requested = `${parts[0]}/${parts[1]}`.toLowerCase();
+  if (requested !== actor.repoScope.toLowerCase()) {
+    return new Response(
+      `Forbidden: token is scoped to ${actor.repoScope}`,
+      { status: 403 },
+    );
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Forward to ripgit
 // ---------------------------------------------------------------------------
 
@@ -1073,6 +1221,9 @@ function forwardToRipgit(
   actor: ActorProps | null,
   env: Env,
 ): Promise<Response> {
+  const outOfScope = denyOutOfScope(request, actor);
+  if (outOfScope) return Promise.resolve(outOfScope);
+
   const headers = new Headers(request.headers);
   if (actor) {
     // For ownership checks in ripgit, what matters is the GitHub username of the

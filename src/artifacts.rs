@@ -101,7 +101,7 @@ pub async fn import_repo(
 /// * **External** — an explicit remote URL and token were supplied for a repo
 ///   outside this namespace. The token is stored, because there is no binding
 ///   through which to mint one.
-pub async fn resolve_source(env: &Env, sql: &SqlStorage) -> Result<(String, String)> {
+pub async fn resolve_source(env: &Env, sql: &SqlStorage) -> Result<(String, RemoteAuth)> {
     if let Some(repo) = store::get_config(sql, CFG_REPO)? {
         let binding_name =
             store::get_config(sql, CFG_BINDING)?.unwrap_or_else(|| DEFAULT_BINDING.to_string());
@@ -109,14 +109,14 @@ pub async fn resolve_source(env: &Env, sql: &SqlStorage) -> Result<(String, Stri
         let token = handle
             .create_token_with_options(ArtifactsTokenScope::Read, Some(TOKEN_TTL_SECS))
             .await?;
-        return Ok((handle.remote(), token.plaintext));
+        return Ok((handle.remote(), RemoteAuth::artifacts(&token.plaintext)));
     }
 
     match (
         store::get_config(sql, CFG_REMOTE)?,
         store::get_config(sql, CFG_TOKEN)?,
     ) {
-        (Some(remote), Some(token)) => Ok((remote, token)),
+        (Some(remote), Some(token)) => Ok((remote, RemoteAuth::artifacts(&token))),
         _ => Err(Error::RustError(
             "no Artifacts repo linked — link one by name (bound namespace) or by remote + token"
                 .to_string(),
@@ -133,17 +133,90 @@ fn token_secret(token: &str) -> &str {
     token.split('?').next().unwrap_or(token)
 }
 
-fn auth_headers(token: &str) -> Result<Headers> {
+/// How to authenticate to a git remote.
+///
+/// Artifacts accepts a bearer token. GitHub's git endpoints do not — they want
+/// HTTP Basic with the token as the password — so the scheme travels with the
+/// credential rather than being assumed by the transport.
+#[derive(Debug, Clone)]
+pub enum RemoteAuth {
+    Bearer(String),
+    Basic { user: String, secret: String },
+}
+
+impl RemoteAuth {
+    /// Bearer credential for an Artifacts repo token, minus any expiry suffix.
+    pub fn artifacts(token: &str) -> Self {
+        RemoteAuth::Bearer(token_secret(token).to_string())
+    }
+
+    /// Basic credential for GitHub. The username is ignored by GitHub as long
+    /// as the token is the password; `x-access-token` is its documented form.
+    pub fn github(token: &str) -> Self {
+        RemoteAuth::Basic {
+            user: "x-access-token".to_string(),
+            secret: token.to_string(),
+        }
+    }
+
+    fn header_value(&self) -> String {
+        match self {
+            RemoteAuth::Bearer(token) => format!("Bearer {}", token),
+            RemoteAuth::Basic { user, secret } => {
+                format!("Basic {}", base64_encode(format!("{}:{}", user, secret).as_bytes()))
+            }
+        }
+    }
+}
+
+/// Standard base64, for HTTP Basic credentials.
+///
+/// Hand-rolled to keep the dependency list as-is; the input is a few dozen
+/// bytes of credential, so nothing here needs to be fast.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(ALPHABET[(triple >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[triple as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+
+    out
+}
+
+fn auth_headers(auth: &RemoteAuth) -> Result<Headers> {
     let headers = Headers::new();
-    headers.set("Authorization", &format!("Bearer {}", token_secret(token)))?;
+    headers.set("Authorization", &auth.header_value())?;
     headers.set("User-Agent", "git/2.40.0 (ripgit)")?;
     Ok(headers)
 }
 
-async fn http(method: Method, url: &str, token: &str, body: Option<Vec<u8>>) -> Result<Vec<u8>> {
+async fn http(
+    method: Method,
+    url: &str,
+    auth: &RemoteAuth,
+    body: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let mut init = RequestInit::new();
     init.with_method(method);
-    let headers = auth_headers(token)?;
+    let headers = auth_headers(auth)?;
     if body.is_some() {
         headers.set("Content-Type", "application/x-git-upload-pack-request")?;
         headers.set("Accept", "application/x-git-upload-pack-result")?;
@@ -176,9 +249,9 @@ pub struct RemoteRef {
 }
 
 /// `GET {remote}/info/refs?service=git-upload-pack` — discover remote refs.
-pub async fn discover_refs(remote: &str, token: &str) -> Result<Vec<RemoteRef>> {
+pub async fn discover_refs(remote: &str, auth: &RemoteAuth) -> Result<Vec<RemoteRef>> {
     let url = format!("{}/info/refs?service=git-upload-pack", remote.trim_end_matches('/'));
-    let body = http(Method::Get, &url, token, None).await?;
+    let body = http(Method::Get, &url, auth, None).await?;
     parse_ref_advertisement(&body)
 }
 
@@ -273,13 +346,13 @@ pub(crate) fn demux_sideband(body: &[u8]) -> Result<Vec<u8>> {
 /// anything reachable from `haves`. An empty `haves` requests a full clone.
 pub async fn fetch_pack(
     remote: &str,
-    token: &str,
+    auth: &RemoteAuth,
     wants: &[String],
     haves: &[String],
 ) -> Result<Vec<u8>> {
     let url = format!("{}/git-upload-pack", remote.trim_end_matches('/'));
     let body = build_fetch_request(wants, haves);
-    let resp = http(Method::Post, &url, token, Some(body)).await?;
+    let resp = http(Method::Post, &url, auth, Some(body)).await?;
     demux_sideband(&resp)
 }
 
@@ -321,10 +394,10 @@ fn local_refs(sql: &SqlStorage) -> Result<Vec<(String, String)>> {
 /// established mirror transfers only new objects. The resulting pack may be
 /// thin — deltas against bases held only in SQLite — which
 /// `process_pack_streaming` already handles via `pack::ExternalObjects`.
-pub async fn sync(sql: &SqlStorage, remote: &str, token: &str) -> Result<SyncReport> {
+pub async fn sync(sql: &SqlStorage, remote: &str, auth: &RemoteAuth) -> Result<SyncReport> {
     let mut report = SyncReport::default();
 
-    let remote_refs = discover_refs(remote, token).await?;
+    let remote_refs = discover_refs(remote, auth).await?;
     if remote_refs.is_empty() {
         return Ok(report); // empty upstream repo — nothing to mirror
     }
@@ -355,7 +428,7 @@ pub async fn sync(sql: &SqlStorage, remote: &str, token: &str) -> Result<SyncRep
     // Every local commit is a candidate cut point for the remote's negotiation.
     let haves: Vec<String> = local.iter().map(|(_, h)| h.clone()).collect();
 
-    let pack = fetch_pack(remote, token, &wants, &haves).await?;
+    let pack = fetch_pack(remote, auth, &wants, &haves).await?;
     report.pack_bytes = pack.len();
 
     if pack.len() > 4 && &pack[..4] == b"PACK" {
@@ -492,6 +565,30 @@ mod tests {
         body.extend(pkt(b"\x03upload-pack: not our ref\n"));
         let err = demux_sideband(&body).unwrap_err().to_string();
         assert!(err.contains("not our ref"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn base64_encodes_with_correct_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn github_auth_uses_basic_and_artifacts_uses_bearer() {
+        // GitHub's git endpoints reject bearer tokens.
+        assert_eq!(
+            RemoteAuth::github("ghs_secret").header_value(),
+            format!("Basic {}", base64_encode(b"x-access-token:ghs_secret")),
+        );
+        // Artifacts tokens carry an expiry suffix that must not be sent.
+        assert_eq!(
+            RemoteAuth::artifacts("art_v1_abc?expires=99").header_value(),
+            "Bearer art_v1_abc",
+        );
     }
 
     #[test]

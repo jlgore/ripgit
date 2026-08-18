@@ -9,7 +9,7 @@ workers_dev = false
 [[kv_namespaces]]
 binding = "REGISTRY"
 [build]
-command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+command = "cargo install -q --git https://github.com/jlgore/workers-rs --rev ccfd63e worker-build && worker-build --release"
 
 [durable_objects]
 bindings = [
@@ -35,3 +35,18 @@ cpu_ms = 300_000
 [[artifacts]]
 binding = "ARTIFACTS"
 namespace = "ripgit"
+
+# Scheduled sweep that pulls enrolled repos from GitHub. This is the backstop
+# for the GitHub Actions push mirror: that path is keyless and fires on every
+# push, but it stops when Actions does, which is one of the outages this mirror
+# exists to survive. The two share no failure mode.
+[[workflows]]
+name = "ripgit-mirror"
+binding = "MIRROR_WORKFLOW"
+class_name = "MirrorWorkflow"
+
+# Pull sweep cadence. Frequent enough that a missed push mirror is caught long
+# before anyone needs the mirror, cheap enough to ignore: one info/refs call per
+# enrolled repo per tick.
+[triggers]
+crons = ["*/15 * * * *"]

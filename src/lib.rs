@@ -4,6 +4,7 @@ mod diff;
 mod git;
 mod issues;
 mod issues_web;
+mod mirror;
 mod pack;
 mod presentation;
 mod schema;
@@ -143,6 +144,21 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }))
 }
 
+/// Cron entry point — sweep enrolled repos for upstream changes.
+///
+/// The push mirror (GitHub Actions + OIDC) keeps repos fresh in normal
+/// operation. This exists for when it does not fire: a missed webhook, a failed
+/// run, or an Actions outage. A mirror you only find out is stale during an
+/// incident is not a mirror.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    match mirror::start_sweep(&env).await {
+        Ok(Some(id)) => console_log!("mirror sweep started: {}", id),
+        Ok(None) => console_log!("mirror sweep skipped: no repos enrolled"),
+        Err(e) => console_error!("mirror sweep failed to start: {}", e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Repository Durable Object
 // ---------------------------------------------------------------------------
@@ -248,6 +264,20 @@ impl DurableObject for Repository {
                     "remote": remote,
                     "last_sync": last,
                 }))
+            }
+
+            // -- GitHub mirror (owner only) --
+            (Method::Post, "mirror") if parts.get(3) == Some(&"link") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                self.link_github(&mut req, owner, repo_name).await
+            }
+            (Method::Post, "mirror") if parts.get(3) == Some(&"sync") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                self.sync_github().await
             }
 
             // -- Delete all data (owner only) --
@@ -1161,8 +1191,53 @@ impl Repository {
 
     /// Pull the linked Artifacts remote into local storage.
     async fn sync_artifacts(&self) -> Result<Response> {
-        let (remote, token) = artifacts::resolve_source(&self.env, &self.sql).await?;
-        let report = artifacts::sync(&self.sql, &remote, &token).await?;
+        let (remote, auth) = artifacts::resolve_source(&self.env, &self.sql).await?;
+        let report = artifacts::sync(&self.sql, &remote, &auth).await?;
+        store::set_config(
+            &self.sql,
+            artifacts::CFG_LAST_SYNC,
+            &Date::now().to_string(),
+        )?;
+        Response::from_json(&report)
+    }
+
+    /// Record the GitHub upstream for this repo and enroll it in the sweep.
+    async fn link_github(
+        &self,
+        req: &mut Request,
+        owner: &str,
+        repo_name: &str,
+    ) -> Result<Response> {
+        #[derive(serde::Deserialize, Default)]
+        struct LinkBody {
+            remote: Option<String>,
+        }
+
+        let body: LinkBody = req.json().await.unwrap_or_default();
+        let Some(remote) = body.remote else {
+            return Response::error("remote is required, e.g. https://github.com/owner/repo", 400);
+        };
+
+        store::set_config(&self.sql, mirror::CFG_GITHUB_REMOTE, &remote)?;
+
+        // Enrollment lives in KV so the scheduled sweep can list repos without
+        // waking every DO to ask whether it has an upstream.
+        let key = format!("{}{}/{}", mirror::REGISTRY_PREFIX, owner, repo_name);
+        if let Ok(kv) = self.env.kv("REGISTRY") {
+            if let Ok(builder) = kv.put(&key, "1") {
+                let _ = builder.execute().await;
+            }
+        }
+
+        Response::from_json(&serde_json::json!({ "linked": true, "remote": remote }))
+    }
+
+    /// Pull this repo's GitHub upstream into local storage.
+    async fn sync_github(&self) -> Result<Response> {
+        let Some((remote, auth)) = mirror::github_source(&self.env, &self.sql)? else {
+            return Response::error("no GitHub upstream configured for this repo", 409);
+        };
+        let report = artifacts::sync(&self.sql, &remote, &auth).await?;
         store::set_config(
             &self.sql,
             artifacts::CFG_LAST_SYNC,

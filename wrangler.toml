@@ -9,7 +9,7 @@ workers_dev = false
 [[kv_namespaces]]
 binding = "REGISTRY"
 [build]
-command = "cargo install -q \"worker-build@^0.7\" && worker-build --release"
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
 
 [durable_objects]
 bindings = [
@@ -27,3 +27,11 @@ invocation_logs = true
 
 [limits]
 cpu_ms = 300_000
+
+# Cloudflare Artifacts — Git-compatible versioned storage. When a repo is
+# linked to an Artifacts remote, ripgit mirrors its objects into the DO and
+# serves the UI over them. Optional: repos can also be linked to an existing
+# remote by URL + token without this binding.
+[[artifacts]]
+binding = "ARTIFACTS"
+namespace = "ripgit"

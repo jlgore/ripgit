@@ -169,7 +169,7 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
 /// the pack bytes (which stay in memory as the request body), delta chains are
 /// resolved iteratively, and the result is stored in permanent tables then
 /// dropped. Only one resolved object exists in memory at a time.
-fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -> Result<()> {
+pub(crate) fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -> Result<()> {
     // --- Build lightweight index ---
     let (index, offset_to_idx) = pack::build_index(pack_data).map_err(|e| Error::RustError(e.0))?;
 
@@ -661,7 +661,7 @@ fn parse_receive_pack_request(data: &[u8]) -> ReceivePackRequest {
 /// Read one pkt-line from data at the given position.
 /// Returns Some((None, new_pos)) for flush, Some((Some(payload), new_pos))
 /// for data, or None if at end of input.
-fn read_pkt_line(data: &[u8], pos: usize) -> Option<(Option<&[u8]>, usize)> {
+pub(crate) fn read_pkt_line(data: &[u8], pos: usize) -> Option<(Option<&[u8]>, usize)> {
     if pos + 4 > data.len() {
         return None;
     }
@@ -910,7 +910,7 @@ fn append_sideband_data(buf: &mut Vec<u8>, channel: u8, data: &[u8], mode: Sideb
     }
 }
 
-fn pkt_line_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+pub(crate) fn pkt_line_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     let len = 4 + data.len();
     buf.extend_from_slice(format!("{:04x}", len).as_bytes());
     buf.extend_from_slice(data);

@@ -1,4 +1,5 @@
 mod api;
+mod artifacts;
 mod diff;
 mod git;
 mod issues;
@@ -221,6 +222,32 @@ impl DurableObject for Repository {
             (Method::Post, "git-upload-pack") => {
                 let body = req.bytes().await?;
                 git::handle_upload_pack(&self.sql, &body)
+            }
+
+            // -- Artifacts mirror (owner only) --
+            (Method::Post, "artifacts") if parts.get(3) == Some(&"link") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                self.link_artifacts(&mut req).await
+            }
+            (Method::Post, "artifacts") if parts.get(3) == Some(&"sync") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                self.sync_artifacts().await
+            }
+            (Method::Get, "artifacts") => {
+                let repo = store::get_config(&self.sql, artifacts::CFG_REPO)?;
+                let remote = store::get_config(&self.sql, artifacts::CFG_REMOTE)?;
+                let last = store::get_config(&self.sql, artifacts::CFG_LAST_SYNC)?;
+                Response::from_json(&serde_json::json!({
+                    "linked": repo.is_some() || remote.is_some(),
+                    "mode": repo.as_ref().map(|_| "bound").or(remote.as_ref().map(|_| "external")),
+                    "repo": repo,
+                    "remote": remote,
+                    "last_sync": last,
+                }))
             }
 
             // -- Delete all data (owner only) --
@@ -1057,6 +1084,93 @@ impl Repository {
 
     /// Ref advertisement for both receive-pack and upload-pack.
     /// Returns current refs in pkt-line format so git knows what we have.
+    /// Link this repo to an Artifacts remote.
+    ///
+    /// Three shapes, in precedence order:
+    ///   `{"repo": "name"}`                     — an existing repo in the bound namespace
+    ///   `{"create": "name"}`                   — provision a new one
+    ///   `{"import": "https://github.com/..."}` — import an external repo, then link it
+    ///   `{"remote": "...", "token": "..."}`    — a repo outside this namespace
+    ///
+    /// The first three store only the repo name; tokens are minted per sync.
+    async fn link_artifacts(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize, Default)]
+        struct LinkBody {
+            repo: Option<String>,
+            create: Option<String>,
+            import: Option<String>,
+            /// Target name for an import. Defaults to this repo's own name.
+            name: Option<String>,
+            branch: Option<String>,
+            remote: Option<String>,
+            token: Option<String>,
+            binding: Option<String>,
+        }
+
+        let body: LinkBody = req.json().await.unwrap_or_default();
+        let binding = body
+            .binding
+            .unwrap_or_else(|| artifacts::DEFAULT_BINDING.to_string());
+
+        // Derive this repo's own name from the DO path for import defaults.
+        let url = req.url()?;
+        let own_name = url
+            .path()
+            .trim_start_matches('/')
+            .split('/')
+            .nth(1)
+            .unwrap_or("repo")
+            .to_string();
+
+        let linked_name = if let Some(repo) = body.repo {
+            repo
+        } else if let Some(name) = body.create {
+            artifacts::create_repo(&self.env, &binding, &name).await?.name
+        } else if let Some(source) = body.import {
+            let target = body.name.unwrap_or(own_name);
+            artifacts::import_repo(
+                &self.env,
+                &binding,
+                &source,
+                &target,
+                body.branch.as_deref(),
+            )
+            .await?
+            .name
+        } else if let (Some(remote), Some(token)) = (body.remote, body.token) {
+            // External repo: no binding to mint through, so the token is stored.
+            store::set_config(&self.sql, artifacts::CFG_REMOTE, &remote)?;
+            store::set_config(&self.sql, artifacts::CFG_TOKEN, &token)?;
+            return Response::from_json(&serde_json::json!({
+                "linked": true, "mode": "external", "remote": remote,
+            }));
+        } else {
+            return Response::error(
+                "provide one of: repo, create, import, or remote + token",
+                400,
+            );
+        };
+
+        store::set_config(&self.sql, artifacts::CFG_REPO, &linked_name)?;
+        store::set_config(&self.sql, artifacts::CFG_BINDING, &binding)?;
+
+        Response::from_json(&serde_json::json!({
+            "linked": true, "mode": "bound", "repo": linked_name, "binding": binding,
+        }))
+    }
+
+    /// Pull the linked Artifacts remote into local storage.
+    async fn sync_artifacts(&self) -> Result<Response> {
+        let (remote, token) = artifacts::resolve_source(&self.env, &self.sql).await?;
+        let report = artifacts::sync(&self.sql, &remote, &token).await?;
+        store::set_config(
+            &self.sql,
+            artifacts::CFG_LAST_SYNC,
+            &Date::now().to_string(),
+        )?;
+        Response::from_json(&report)
+    }
+
     fn advertise_refs(&self, service: &str) -> Result<Response> {
         let content_type = format!("application/x-{}-advertisement", service);
 

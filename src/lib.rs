@@ -285,6 +285,24 @@ impl DurableObject for Repository {
                 }
                 self.sync_artifacts().await
             }
+            (Method::Get, "artifacts") if parts.get(3) == Some(&"debug") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                let step = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "step")
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_else(|| "binding".to_string());
+                let arg = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "create")
+                    .map(|(_, v)| v.to_string());
+                match artifacts::debug_step(&self.env, &self.sql, &step, arg.as_deref()).await {
+                    Ok(value) => Response::from_json(&value),
+                    Err(e) => Response::error(format!("step `{}` failed: {}", step, e), 502),
+                }
+            }
             (Method::Get, "artifacts") => {
                 let repo = store::get_config(&self.sql, artifacts::CFG_REPO)?;
                 let remote = store::get_config(&self.sql, artifacts::CFG_REMOTE)?;
@@ -1210,21 +1228,30 @@ impl Repository {
             .unwrap_or("repo")
             .to_string();
 
+        // Binding errors carry the useful detail -- a missing binding, a name
+        // already taken, a namespace the account cannot reach. Propagating them
+        // as Err would collapse all of that into a bare 500.
         let linked_name = if let Some(repo) = body.repo {
             repo
         } else if let Some(name) = body.create {
-            artifacts::create_repo(&self.env, &binding, &name).await?.name
+            match artifacts::create_repo(&self.env, &binding, &name).await {
+                Ok(created) => created.name,
+                Err(e) => return Response::error(format!("artifacts create failed: {}", e), 502),
+            }
         } else if let Some(source) = body.import {
             let target = body.name.unwrap_or(own_name);
-            artifacts::import_repo(
+            match artifacts::import_repo(
                 &self.env,
                 &binding,
                 &source,
                 &target,
                 body.branch.as_deref(),
             )
-            .await?
-            .name
+            .await
+            {
+                Ok(imported) => imported.name,
+                Err(e) => return Response::error(format!("artifacts import failed: {}", e), 502),
+            }
         } else if let (Some(remote), Some(token)) = (body.remote, body.token) {
             // External repo: no binding to mint through, so the token is stored.
             store::set_config(&self.sql, artifacts::CFG_REMOTE, &remote)?;
@@ -1249,8 +1276,14 @@ impl Repository {
 
     /// Pull the linked Artifacts remote into local storage.
     async fn sync_artifacts(&self) -> Result<Response> {
-        let (remote, auth) = artifacts::resolve_source(&self.env, &self.sql).await?;
-        let report = artifacts::sync(&self.sql, &remote, &auth).await?;
+        let (remote, auth) = match artifacts::resolve_source(&self.env, &self.sql).await {
+            Ok(source) => source,
+            Err(e) => return Response::error(format!("artifacts not reachable: {}", e), 502),
+        };
+        let report = match artifacts::sync(&self.sql, &remote, &auth).await {
+            Ok(report) => report,
+            Err(e) => return Response::error(format!("artifacts sync failed: {}", e), 502),
+        };
         store::set_config(
             &self.sql,
             artifacts::CFG_LAST_SYNC,
@@ -1315,7 +1348,15 @@ impl Repository {
 
     /// Pull this repo's GitHub upstream into local storage.
     async fn sync_github(&self) -> Result<Response> {
-        let Some((remote, auth)) = mirror::github_source(&self.env, &self.sql)? else {
+        // Surface configuration problems as text rather than letting the error
+        // propagate: a bare Err from a DO becomes an opaque 500, which is how a
+        // missing GITHUB_MIRROR_TOKEN reads as "INTERNAL SERVER ERROR" instead
+        // of naming the secret that has to be set.
+        let source = match mirror::github_source(&self.env, &self.sql) {
+            Ok(source) => source,
+            Err(e) => return Response::error(format!("mirror misconfigured: {}", e), 500),
+        };
+        let Some((remote, auth)) = source else {
             return Response::error("no GitHub upstream configured for this repo", 409);
         };
         // A promoted repo holds commits upstream has never seen. Syncing would
@@ -1326,7 +1367,12 @@ impl Repository {
                 409,
             );
         }
-        let report = artifacts::sync(&self.sql, &remote, &auth).await?;
+        // An unreachable or rejecting upstream is not this worker's fault, and
+        // the reason it gave is the only useful thing to report.
+        let report = match artifacts::sync(&self.sql, &remote, &auth).await {
+            Ok(report) => report,
+            Err(e) => return Response::error(format!("upstream sync failed: {}", e), 502),
+        };
         store::set_config(
             &self.sql,
             artifacts::CFG_LAST_SYNC,

@@ -19,7 +19,7 @@
 use crate::git;
 use crate::store;
 use worker::{
-    ArtifactsImportParams, ArtifactsImportSource, ArtifactsImportTarget, ArtifactsTokenScope,
+    ArtifactsImportParams, ArtifactsImportSource, ArtifactsImportTarget, ArtifactsListOptions,
 };
 use worker::*;
 
@@ -105,11 +105,22 @@ pub async fn resolve_source(env: &Env, sql: &SqlStorage) -> Result<(String, Remo
     if let Some(repo) = store::get_config(sql, CFG_REPO)? {
         let binding_name =
             store::get_config(sql, CFG_BINDING)?.unwrap_or_else(|| DEFAULT_BINDING.to_string());
-        let handle = env.artifacts(&binding_name)?.get(&repo).await?;
-        let token = handle
-            .create_token_with_options(ArtifactsTokenScope::Read, Some(TOKEN_TTL_SECS))
-            .await?;
-        return Ok((handle.remote(), RemoteAuth::artifacts(&token.plaintext)));
+
+        // The repo's own URL cannot be read off the handle: a stub carries no
+        // data properties, so every accessor on it yields an RPC proxy rather
+        // than a string. list() returns the same metadata as plain JSON, so the
+        // URL is looked up once there and cached.
+        let remote = match store::get_config(sql, CFG_REMOTE)? {
+            Some(remote) => remote,
+            None => {
+                let remote = lookup_remote(env, &binding_name, &repo).await?;
+                store::set_config(sql, CFG_REMOTE, &remote)?;
+                remote
+            }
+        };
+
+        let token = mint_read_token(env, &binding_name, &repo).await?;
+        return Ok((remote, RemoteAuth::artifacts(&token)));
     }
 
     match (
@@ -122,6 +133,68 @@ pub async fn resolve_source(env: &Env, sql: &SqlStorage) -> Result<(String, Remo
                 .to_string(),
         )),
     }
+}
+
+/// Find a repo's git URL from `list()`, which returns plain JSON.
+async fn lookup_remote(env: &Env, binding: &str, repo: &str) -> Result<String> {
+    let artifacts = env.artifacts(binding)?;
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let mut options = ArtifactsListOptions::new().limit(100);
+        if let Some(c) = &cursor {
+            options = options.cursor(c.clone());
+        }
+        let page = artifacts.list_with_options(&options).await?;
+
+        if let Some(found) = page
+            .repos
+            .iter()
+            .find(|r| r.name == repo)
+            .and_then(|r| r.remote.clone())
+        {
+            return Ok(found);
+        }
+
+        match page.cursor {
+            Some(next) if !page.repos.is_empty() => cursor = Some(next),
+            _ => break,
+        }
+    }
+
+    Err(Error::RustError(format!(
+        "artifacts repo `{}` not found in namespace",
+        repo
+    )))
+}
+
+/// Mint a short-lived read token for a repo, via the JS shim.
+///
+/// The typed binding cannot do this: `get()` resolves to a stub, and awaiting a
+/// stub-valued promise never settles in Rust even though the identical call
+/// resolves in JS. The shim performs the call in JS and returns plain data.
+async fn mint_read_token(env: &Env, binding: &str, repo: &str) -> Result<String> {
+    use worker::js_sys::Reflect;
+    use worker::wasm_bindgen::JsValue;
+    use worker::wasm_bindgen_futures::JsFuture;
+
+    let raw = Reflect::get(env.as_ref(), &JsValue::from_str(binding))
+        .map_err(|_| Error::RustError(format!("no `{}` binding on env", binding)))?;
+
+    let wrapped = JsFuture::from(rpc_shim::rpc_get(&raw, repo))
+        .await
+        .map_err(|e| Error::RustError(format!("artifacts get failed: {:?}", e)))?;
+    let handle = Reflect::get(&wrapped, &JsValue::from_str("handle"))
+        .map_err(|_| Error::RustError("artifacts get returned no handle".to_string()))?;
+
+    let token = JsFuture::from(rpc_shim::rpc_create_token(&handle, "read", TOKEN_TTL_SECS))
+        .await
+        .map_err(|e| Error::RustError(format!("artifacts createToken failed: {:?}", e)))?;
+
+    Reflect::get(&token, &JsValue::from_str("plaintext"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .ok_or_else(|| Error::RustError("artifacts token had no plaintext".to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +701,32 @@ mod tests {
 }
 
 
+/// JS shims for RPC calls whose result is a stub rather than plain data.
+///
+/// Two things Rust cannot do directly to an RPC stub. It cannot invoke a method
+/// through `Function.prototype.call`, which the receiver rejects outright, and
+/// awaiting a promise that *resolves to* a stub never settles -- the same call
+/// awaited from JS resolves fine. Both are avoided by doing the call in JS and
+/// handing back a plain object with the stub as a field.
+mod rpc_shim {
+    use worker::js_sys::Promise;
+    use worker::wasm_bindgen;
+    use worker::wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(inline_js = r#"
+        export function rpc_get(binding, name) {
+          return Promise.resolve(binding.get(name)).then((handle) => ({ handle }));
+        }
+        export function rpc_create_token(handle, scope, ttl) {
+          return handle.createToken(scope, ttl);
+        }
+    "#)]
+    extern "C" {
+        pub fn rpc_get(binding: &JsValue, name: &str) -> Promise;
+        pub fn rpc_create_token(handle: &JsValue, scope: &str, ttl: u32) -> Promise;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
@@ -655,6 +754,40 @@ pub async fn debug_step(
         store::get_config(sql, CFG_BINDING)?.unwrap_or_else(|| DEFAULT_BINDING.to_string());
     let repo = store::get_config(sql, CFG_REPO)?
         .ok_or_else(|| Error::RustError("no artifacts repo linked".to_string()))?;
+
+    // Does routing the stub-returning call through a JS shim avoid the hang?
+    if step == "get_shim" {
+        use worker::js_sys::Reflect;
+        use worker::wasm_bindgen::JsValue;
+        use worker::wasm_bindgen_futures::JsFuture;
+
+        let raw = Reflect::get(env.as_ref(), &JsValue::from_str(&binding_name))
+            .map_err(|_| Error::RustError("binding lookup failed".to_string()))?;
+
+        let wrapped = JsFuture::from(rpc_shim::rpc_get(&raw, &repo))
+            .await
+            .map_err(|e| Error::RustError(format!("shim get rejected: {:?}", e)))?;
+        let handle = Reflect::get(&wrapped, &JsValue::from_str("handle"))
+            .map_err(|_| Error::RustError("no `handle` on shim result".to_string()))?;
+
+        let token = JsFuture::from(rpc_shim::rpc_create_token(&handle, "read", 900))
+            .await
+            .map_err(|e| Error::RustError(format!("shim createToken rejected: {:?}", e)))?;
+        let plaintext = Reflect::get(&token, &JsValue::from_str("plaintext"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let expires = Reflect::get(&token, &JsValue::from_str("expiresAt"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+
+        return Ok(serde_json::json!({
+            "shim_get": "resolved",
+            "token_len": plaintext.len(),
+            "expires_at": expires,
+        }));
+    }
 
     let artifacts = env.artifacts(&binding_name)?;
 

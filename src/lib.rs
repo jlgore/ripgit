@@ -285,24 +285,6 @@ impl DurableObject for Repository {
                 }
                 self.sync_artifacts().await
             }
-            (Method::Get, "artifacts") if parts.get(3) == Some(&"debug") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
-                    return resp;
-                }
-                let step = url
-                    .query_pairs()
-                    .find(|(k, _)| k == "step")
-                    .map(|(_, v)| v.to_string())
-                    .unwrap_or_else(|| "binding".to_string());
-                let arg = url
-                    .query_pairs()
-                    .find(|(k, _)| k == "create")
-                    .map(|(_, v)| v.to_string());
-                match artifacts::debug_step(&self.env, &self.sql, &step, arg.as_deref()).await {
-                    Ok(value) => Response::from_json(&value),
-                    Err(e) => Response::error(format!("step `{}` failed: {}", step, e), 502),
-                }
-            }
             (Method::Get, "artifacts") => {
                 let repo = store::get_config(&self.sql, artifacts::CFG_REPO)?;
                 let remote = store::get_config(&self.sql, artifacts::CFG_REMOTE)?;

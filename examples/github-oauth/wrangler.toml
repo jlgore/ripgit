@@ -9,6 +9,7 @@ compatibility_flags = ["nodejs_compat"]
 #   wrangler kv namespace create OAUTH_KV --preview
 [[kv_namespaces]]
 binding = "OAUTH_KV"
+id = "a643f207be5045f49fb9316b227456f5"
 
 # Service binding to the ripgit worker.
 # The service name must match `name` in ripgit's wrangler.toml.
@@ -34,4 +35,4 @@ GITHUB_CLIENT_ID = "<your-app-id>"
 # mirror token. Pin this to THIS deployment's URL. GitHub's default audience is
 # the repo owner's URL, which every service that owner runs shares — a token
 # minted for one of them would otherwise be replayable here.
-OIDC_AUDIENCE = "https://your-worker.workers.dev"
+OIDC_AUDIENCE = "https://ripgit-auth.sharted.workers.dev"

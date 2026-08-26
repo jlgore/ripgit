@@ -8,6 +8,7 @@ workers_dev = false
 # Create with: wrangler kv namespace create REGISTRY
 [[kv_namespaces]]
 binding = "REGISTRY"
+id = "b80650158bf14ea6852df7a0302f6e10"
 [build]
 command = "cargo install -q --git https://github.com/jlgore/workers-rs --rev ccfd63e worker-build && worker-build --release"
 
@@ -48,5 +49,7 @@ class_name = "MirrorWorkflow"
 # Pull sweep cadence. Frequent enough that a missed push mirror is caught long
 # before anyone needs the mirror, cheap enough to ignore: one info/refs call per
 # enrolled repo per tick.
-[triggers]
-crons = ["*/15 * * * *"]
+# Disabled until at least one repo is enrolled for pull mirroring. Re-enable by
+# uncommenting once `POST /:owner/:repo/mirror/link` has been used.
+# [triggers]
+# crons = ["*/15 * * * *"]

@@ -17,6 +17,7 @@
 //!    remote needs the mirror image of it.
 
 use crate::git;
+use crate::pack;
 use crate::store;
 use worker::{
     ArtifactsImportParams, ArtifactsImportSource, ArtifactsImportTarget, ArtifactsTokenScope,
@@ -452,6 +453,18 @@ pub async fn sync(sql: &SqlStorage, remote: &str, auth: &RemoteAuth) -> Result<S
 
     let pack = fetch_pack(remote, auth, &wants, &haves).await?;
     report.pack_bytes = pack.len();
+
+    // The push path rejects oversized packs before parsing; the pull path must
+    // too. A Durable Object has far less memory than a large repo's pack, so
+    // without this the sync dies on an allocation with no usable error -- the
+    // same silent hang class as the receive-pack guard was written to avoid.
+    if pack.len() > pack::MAX_PACK_BYTES {
+        return Err(Error::RustError(format!(
+            "upstream pack is {} MB, over the {} MB limit; this repo is too large to mirror",
+            pack.len() / 1_000_000,
+            pack::MAX_PACK_BYTES / 1_000_000,
+        )));
+    }
 
     if pack.len() > 4 && &pack[..4] == b"PACK" {
         let bulk_mode = store::get_config(sql, "skip_fts")?

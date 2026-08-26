@@ -2,7 +2,7 @@
   "name": "ripgit-tests",
   "private": true,
   "scripts": {
-    "build:worker": "cargo install -q --git https://github.com/jlgore/workers-rs --rev 778a63a worker-build && worker-build --release",
+    "build:worker": "cargo install -q --git https://github.com/jlgore/workers-rs --rev afed3da worker-build && worker-build --release",
     "test": "npm run build:worker && NODE_OPTIONS='--experimental-vm-modules' vitest run"
   },
   "devDependencies": {

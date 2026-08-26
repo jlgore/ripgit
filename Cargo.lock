@@ -969,7 +969,7 @@ checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 [[package]]
 name = "worker"
 version = "0.8.5"
-source = "git+https://github.com/jlgore/workers-rs?rev=778a63a#778a63ac6f41ea9f4649825d904ff2cb450a6582"
+source = "git+https://github.com/jlgore/workers-rs?rev=afed3da#afed3dac57c3a974b2e98d7504d23f0097a76441"
 dependencies = [
  "async-trait",
  "bytes",
@@ -999,7 +999,7 @@ dependencies = [
 [[package]]
 name = "worker-macros"
 version = "0.8.5"
-source = "git+https://github.com/jlgore/workers-rs?rev=778a63a#778a63ac6f41ea9f4649825d904ff2cb450a6582"
+source = "git+https://github.com/jlgore/workers-rs?rev=afed3da#afed3dac57c3a974b2e98d7504d23f0097a76441"
 dependencies = [
  "async-trait",
  "proc-macro2",
@@ -1014,7 +1014,7 @@ dependencies = [
 [[package]]
 name = "worker-sys"
 version = "0.8.5"
-source = "git+https://github.com/jlgore/workers-rs?rev=778a63a#778a63ac6f41ea9f4649825d904ff2cb450a6582"
+source = "git+https://github.com/jlgore/workers-rs?rev=afed3da#afed3dac57c3a974b2e98d7504d23f0097a76441"
 dependencies = [
  "cfg-if",
  "js-sys",

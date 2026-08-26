@@ -23,7 +23,7 @@ service = "ripgit"
 #   Homepage URL:            https://your-worker.workers.dev
 #   Authorization callback:  https://your-worker.workers.dev/oauth/callback
 #   (local dev callback:     http://localhost:8787/oauth/callback)
-GITHUB_CLIENT_ID = "<your-app-id>"
+GITHUB_CLIENT_ID = "Ov23lizgetI6GvNY2McM"
 
 # GitHub OAuth App client secret — set as a secret, not a var:
 #   wrangler secret put GITHUB_CLIENT_SECRET

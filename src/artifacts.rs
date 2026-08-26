@@ -402,6 +402,22 @@ pub async fn sync(sql: &SqlStorage, remote: &str, auth: &RemoteAuth) -> Result<S
         return Ok(report); // empty upstream repo — nothing to mirror
     }
 
+    // A remote advertises HEAD alongside real refs. It is a pointer, not a ref
+    // to store: writing it would put a bogus `HEAD` row in the refs table, and
+    // ripgit adds its own HEAD line when it later advertises this repo, so the
+    // mirror would advertise HEAD twice and confuse clients cloning it.
+    let head_hash = remote_refs
+        .iter()
+        .find(|r| r.name == "HEAD")
+        .map(|r| r.hash.clone());
+    let remote_refs: Vec<RemoteRef> = remote_refs
+        .into_iter()
+        .filter(|r| r.name.starts_with("refs/"))
+        .collect();
+    if remote_refs.is_empty() {
+        return Ok(report);
+    }
+
     let local = local_refs(sql)?;
     let local_by_name: std::collections::HashMap<&str, &str> = local
         .iter()
@@ -440,8 +456,14 @@ pub async fn sync(sql: &SqlStorage, remote: &str, auth: &RemoteAuth) -> Result<S
 
     // Point local refs at the remote hashes now that the objects are stored.
     for r in &remote_refs {
-        let old = local_by_name.get(r.name.as_str()).unwrap_or(&"");
-        if *old == r.hash.as_str() {
+        // A ref we do not have yet is a *creation*, which update_ref signals with
+        // the all-zero hash rather than an empty string, the same way a git client
+        // does in a receive-pack command.
+        let old = local_by_name
+            .get(r.name.as_str())
+            .copied()
+            .unwrap_or(store::ZERO_HASH);
+        if old == r.hash.as_str() {
             continue;
         }
         match store::update_ref(sql, &r.name, old, &r.hash) {
@@ -452,9 +474,16 @@ pub async fn sync(sql: &SqlStorage, remote: &str, auth: &RemoteAuth) -> Result<S
 
     // Adopt a default branch on first sync so the UI has something to render.
     if store::get_config(sql, "default_branch")?.is_none() {
-        let preferred = remote_refs
-            .iter()
-            .find(|r| r.name == "refs/heads/main")
+        // Follow HEAD when the advertisement gave one: the branch it points at is
+        // the upstream's own answer, rather than our guess.
+        let preferred = head_hash
+            .as_ref()
+            .and_then(|h| {
+                remote_refs
+                    .iter()
+                    .find(|r| &r.hash == h && r.name.starts_with("refs/heads/"))
+            })
+            .or_else(|| remote_refs.iter().find(|r| r.name == "refs/heads/main"))
             .or_else(|| remote_refs.iter().find(|r| r.name == "refs/heads/master"))
             .or_else(|| remote_refs.iter().find(|r| r.name.starts_with("refs/heads/")));
         if let Some(r) = preferred {

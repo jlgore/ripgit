@@ -18,6 +18,10 @@ function miniflareOptions() {
           { type: "CompiledWasm", include: ["**/*.wasm"], fallthrough: true },
         ],
         kvNamespaces: ["REGISTRY"],
+        // Credential the GitHub pull mirror authenticates with. The upstream in
+        // tests is another ripgit repo, which ignores Authorization entirely —
+        // but it must be set for the sync path to run at all.
+        bindings: { GITHUB_MIRROR_TOKEN: "test-mirror-token" },
         durableObjects: {
           REPOSITORY: {
             className: "Repository",

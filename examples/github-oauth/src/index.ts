@@ -1228,6 +1228,18 @@ function forwardToRipgit(
   if (outOfScope) return Promise.resolve(outOfScope);
 
   const headers = new Headers(request.headers);
+
+  // Strip any actor headers the caller supplied before setting our own. ripgit
+  // treats these as proof of identity, so a forged X-Ripgit-Actor-Name would be
+  // full write access to someone else's repos, and X-Ripgit-Actor-Scopes:mirror
+  // would walk past the mirror divergence guard. Nothing from the public
+  // internet may reach ripgit under these names.
+  for (const name of [...headers.keys()]) {
+    if (name.toLowerCase().startsWith("x-ripgit-actor")) {
+      headers.delete(name);
+    }
+  }
+
   if (actor) {
     // For ownership checks in ripgit, what matters is the GitHub username of the
     // person who owns the repos. For agents, that's ownerActorName, not actorName

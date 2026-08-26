@@ -193,14 +193,22 @@ export async function verifyGitHubOidcToken(
 /**
  * Which GitHub repo may mirror into which ripgit repo.
  *
- * Explicit rather than inferred: GitHub repos live under several owners
- * (a personal account and one or more orgs) that do not map onto ripgit owners
- * by any rule worth guessing at. Declaring the mapping also means a workflow
- * can only ever write to the one repo an admin chose for it.
+ * Two levels, most specific first:
  *
- * Stored in KV as `mirror:<github owner>/<github repo>`:
+ *   `mirror:<owner>/<repo>`  a single repo, with an explicit target and refs
+ *   `mirror-owner:<owner>`   any repo under that owner, mirroring to the
+ *                            matching `<owner>/<repo>` path in ripgit
  *
- *   { "target": "jlgore/ripgit", "refs": ["refs/heads/main"] }
+ * Owner-level trust is safe because the minted token stays scoped to the one
+ * repository the OIDC claim names: a workflow can only ever write to its own
+ * mirror, which is the only thing it would legitimately do. What owner-level
+ * enrollment removes is the bookkeeping -- adding `mirror.yml` to a repo is
+ * then the only step, rather than a repo change plus a KV write.
+ *
+ * Stored as JSON:
+ *
+ *   { "target": "jlgore/ripgit", "refs": ["refs/heads/main"] }   (per repo)
+ *   { "refs": ["refs/heads/main"] }                              (per owner)
  */
 export interface MirrorGrant {
   /** "owner/repo" path within ripgit that this workflow may push to. */
@@ -213,11 +221,27 @@ export async function lookupMirrorGrant(
   kv: KVNamespace,
   repository: string,
 ): Promise<MirrorGrant | null> {
-  const raw = await kv.get(`mirror:${repository.toLowerCase()}`);
-  if (!raw) return null;
-  const grant = JSON.parse(raw) as MirrorGrant;
-  if (!grant.target || !grant.target.includes("/")) {
-    throw new OidcError(`mirror grant for ${repository} has no valid target`);
+  const key = repository.toLowerCase();
+
+  const explicit = await kv.get(`mirror:${key}`);
+  if (explicit) {
+    const grant = JSON.parse(explicit) as MirrorGrant;
+    if (!grant.target || !grant.target.includes("/")) {
+      throw new OidcError(`mirror grant for ${repository} has no valid target`);
+    }
+    return grant;
   }
-  return grant;
+
+  const [owner, name] = key.split("/");
+  if (!owner || !name) return null;
+
+  const byOwner = await kv.get(`mirror-owner:${owner}`);
+  if (byOwner) {
+    // The target is derived, never taken from the request: the owner comes from
+    // the signed claim and the repo name with it.
+    const grant = JSON.parse(byOwner) as Omit<MirrorGrant, "target">;
+    return { target: `${owner}/${name}`, refs: grant.refs };
+  }
+
+  return null;
 }

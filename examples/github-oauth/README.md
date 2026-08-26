@@ -34,13 +34,24 @@ as the password of an HTTPS git remote.
 
 A copy-paste workflow lives in `examples/github-actions-mirror/mirror.yml`.
 
-### Enrolling A Repo
+### Enrolling
 
-Which GitHub repo may mirror into which ripgit repo is an explicit allowlist,
-not a rule. GitHub repos live under several owners — a personal account and any
-number of orgs — that do not map onto ripgit owners by any rule worth guessing
-at, and declaring the mapping also means a workflow can only ever write to the
-one repo an admin chose for it.
+Enrollment has two levels. Owner-level trust says any repo under an owner may
+mirror to the matching path in ripgit:
+
+```bash
+wrangler kv key put --binding OAUTH_KV "mirror-owner:jlgore" \
+  '{"refs":["refs/heads/main"]}'
+```
+
+Adding `mirror.yml` to a repo is then the only step needed to start mirroring
+it. This stays safe because the minted token is scoped to the single repository
+the signed OIDC claim names, and the ripgit target is derived from that claim
+rather than taken from the request -- a workflow can only ever write to its own
+mirror.
+
+A per-repo entry overrides the owner rule, for a target that does not match the
+GitHub path or a different set of refs:
 
 ```bash
 wrangler kv key put --binding OAUTH_KV "mirror:jlgore/ripgit" \
@@ -50,8 +61,8 @@ wrangler kv key put --binding OAUTH_KV "mirror:jlgore/ripgit" \
 - `target` — the `owner/repo` path in ripgit this workflow may push to.
 - `refs` — optional; if set, only these refs may trigger an exchange.
 
-The key is lowercased on lookup. Remove the key to revoke mirroring; already
-minted tokens still expire on their own within ten minutes.
+Keys are lowercased on lookup. Remove a key to revoke; already minted tokens
+still expire on their own within ten minutes.
 
 ### Why The Audience Must Be Pinned
 

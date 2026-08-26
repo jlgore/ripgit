@@ -1154,7 +1154,10 @@ async function handleOidcExchange(
       // Ownership in ripgit is checked against the *target* owner, which is the
       // allowlist's decision — not against the GitHub owner in the token.
       ownerActorName: targetOwner,
-      scopes: ["push"],
+      // `mirror` distinguishes this from a human token: a mirrored repo
+      // refuses direct pushes, but the mirror agent's own push is the
+      // mechanism that delivers commits.
+      scopes: ["push", "mirror"],
       repoScope: grant.target,
     };
     await env.OAUTH_KV.put(`agent:${token}`, JSON.stringify(actor), {

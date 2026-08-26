@@ -29,6 +29,19 @@ pub const CFG_GITHUB_REMOTE: &str = "mirror_github_remote";
 /// into the registry KV when the upstream is linked.
 pub const REGISTRY_PREFIX: &str = "mirror:";
 
+/// Config key set when a repo has been promoted to primary during an outage.
+pub const CFG_PROMOTED: &str = "mirror_promoted";
+
+/// Config key holding the refs as they stood at promotion — the point local
+/// history diverged from upstream, and where reconciliation has to start.
+pub const CFG_FORK_POINT: &str = "mirror_fork_point";
+
+/// Scope that marks an actor as the mirror agent rather than a person.
+///
+/// Minted only by the OIDC exchange, which knows the push came from a GitHub
+/// Actions run rather than a human with a token.
+pub const MIRROR_SCOPE: &str = "mirror";
+
 /// Worker secret holding the credential used to pull from GitHub.
 ///
 /// This lives in Cloudflare rather than in GitHub, which is the whole point:
@@ -233,4 +246,67 @@ pub async fn start_sweep(env: &Env) -> Result<Option<String>> {
         .await?;
 
     Ok(Some(instance.id()))
+}
+
+// ---------------------------------------------------------------------------
+// Divergence guard
+// ---------------------------------------------------------------------------
+
+/// Whether this repo tracks an upstream, by either mirror path.
+pub fn is_mirrored(sql: &SqlStorage) -> Result<bool> {
+    Ok(crate::store::get_config(sql, CFG_GITHUB_REMOTE)?.is_some()
+        || crate::store::get_config(sql, crate::artifacts::CFG_REPO)?.is_some()
+        || crate::store::get_config(sql, crate::artifacts::CFG_REMOTE)?.is_some())
+}
+
+/// Whether this repo has been promoted to accept writes during an outage.
+pub fn is_promoted(sql: &SqlStorage) -> Result<bool> {
+    Ok(crate::store::get_config(sql, CFG_PROMOTED)?.as_deref() == Some("1"))
+}
+
+/// Why a push to this repo must be refused, or None if it may proceed.
+///
+/// A mirror follows its upstream: anything pushed here directly is overwritten
+/// by the next sweep, silently and with no record that it existed. Refusing the
+/// push is the only outcome that does not lose work.
+///
+/// Two pushes are still legitimate. The mirror agent's own push is how the
+/// GitHub Actions path delivers commits in the first place, and it carries a
+/// scope no human token has. And a repo explicitly promoted during an outage is
+/// deliberately accepting local history — that is the whole point of promoting.
+pub fn push_rejection(sql: &SqlStorage, actor_scopes: &[String]) -> Result<Option<String>> {
+    if !is_mirrored(sql)? {
+        return Ok(None);
+    }
+    if actor_scopes.iter().any(|s| s == MIRROR_SCOPE) {
+        return Ok(None);
+    }
+    if is_promoted(sql)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        "this repo mirrors an upstream and would be overwritten by the next sync; \
+         promote it first with POST /:owner/:repo/mirror/promote"
+            .to_string(),
+    ))
+}
+
+/// Record where local history left upstream, so reconciliation has a base.
+pub fn record_fork_point(sql: &SqlStorage) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        name: String,
+        commit_hash: String,
+    }
+    let rows: Vec<Row> = sql
+        .exec("SELECT name, commit_hash FROM refs ORDER BY name", None)?
+        .to_array()?;
+
+    let refs: serde_json::Map<String, serde_json::Value> = rows
+        .into_iter()
+        .map(|r| (r.name, serde_json::Value::String(r.commit_hash)))
+        .collect();
+
+    let point = serde_json::json!({ "at": Date::now().to_string(), "refs": refs });
+    crate::store::set_config(sql, CFG_FORK_POINT, &point.to_string())
 }

@@ -26,11 +26,33 @@ pub const KEYFRAME_INTERVAL: i64 = 50;
 
 struct Actor {
     display_name: String,
+    /// Capabilities granted by the auth worker, e.g. the mirror agent's
+    /// `mirror` scope. Absent for anonymous or legacy callers.
+    scopes: Vec<String>,
 }
 
 fn actor_from_request(req: &Request) -> Option<Actor> {
-    let name = req.headers().get("X-Ripgit-Actor-Name").ok()??;
-    Some(Actor { display_name: name })
+    let headers = req.headers();
+    let name = headers.get("X-Ripgit-Actor-Name").ok()??;
+    let scopes = headers
+        .get("X-Ripgit-Actor-Scopes")
+        .ok()
+        .flatten()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Actor {
+        display_name: name,
+        scopes,
+    })
+}
+
+fn actor_scopes(actor: &Option<Actor>) -> Vec<String> {
+    actor.as_ref().map(|a| a.scopes.clone()).unwrap_or_default()
 }
 
 /// Returns a deny Response if the actor cannot write to this repo, else None.
@@ -211,6 +233,13 @@ impl DurableObject for Repository {
                         if let Some(resp) = check_write_access(&actor, owner) {
                             return resp;
                         }
+                        // Refuse at advertisement time so git reports the reason
+                        // before spending a pack upload on a doomed push.
+                        if let Some(reason) =
+                            mirror::push_rejection(&self.sql, &actor_scopes(&actor))?
+                        {
+                            return Response::error(format!("Forbidden: {}", reason), 403);
+                        }
                         self.advertise_refs("git-receive-pack")
                     }
                     "git-upload-pack" => self.advertise_refs("git-upload-pack"),
@@ -220,6 +249,9 @@ impl DurableObject for Repository {
             (Method::Post, "git-receive-pack") => {
                 if let Some(resp) = check_write_access(&actor, owner) {
                     return resp;
+                }
+                if let Some(reason) = mirror::push_rejection(&self.sql, &actor_scopes(&actor))? {
+                    return Response::error(format!("Forbidden: {}", reason), 403);
                 }
                 let body = req.bytes().await?;
                 let resp = git::handle_receive_pack(&self.sql, &body)?;
@@ -263,6 +295,32 @@ impl DurableObject for Repository {
                     "repo": repo,
                     "remote": remote,
                     "last_sync": last,
+                }))
+            }
+
+            // -- Mirror failover (owner only) --
+            (Method::Post, "mirror") if parts.get(3) == Some(&"promote") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                self.promote_mirror().await
+            }
+            (Method::Post, "mirror") if parts.get(3) == Some(&"demote") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                store::set_config(&self.sql, mirror::CFG_PROMOTED, "0")?;
+                Response::from_json(&serde_json::json!({ "promoted": false }))
+            }
+            (Method::Get, "mirror") => {
+                let fork_point = store::get_config(&self.sql, mirror::CFG_FORK_POINT)?
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+                Response::from_json(&serde_json::json!({
+                    "mirrored": mirror::is_mirrored(&self.sql)?,
+                    "promoted": mirror::is_promoted(&self.sql)?,
+                    "upstream": store::get_config(&self.sql, mirror::CFG_GITHUB_REMOTE)?,
+                    "last_sync": store::get_config(&self.sql, artifacts::CFG_LAST_SYNC)?,
+                    "fork_point": fork_point,
                 }))
             }
 
@@ -1201,6 +1259,29 @@ impl Repository {
         Response::from_json(&report)
     }
 
+    /// Accept local writes while upstream is unreachable.
+    ///
+    /// Deliberate rather than automatic: failing over on a flapping upstream
+    /// would give two writable copies of the same repo and no way to tell which
+    /// is authoritative.
+    async fn promote_mirror(&self) -> Result<Response> {
+        if !mirror::is_mirrored(&self.sql)? {
+            return Response::error("this repo does not mirror an upstream", 409);
+        }
+        if !mirror::is_promoted(&self.sql)? {
+            // Only on the transition, so re-promoting cannot move the base and
+            // strand commits written since the first promotion.
+            mirror::record_fork_point(&self.sql)?;
+            store::set_config(&self.sql, mirror::CFG_PROMOTED, "1")?;
+        }
+        let fork_point = store::get_config(&self.sql, mirror::CFG_FORK_POINT)?
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        Response::from_json(&serde_json::json!({
+            "promoted": true,
+            "fork_point": fork_point,
+        }))
+    }
+
     /// Record the GitHub upstream for this repo and enroll it in the sweep.
     async fn link_github(
         &self,
@@ -1237,6 +1318,14 @@ impl Repository {
         let Some((remote, auth)) = mirror::github_source(&self.env, &self.sql)? else {
             return Response::error("no GitHub upstream configured for this repo", 409);
         };
+        // A promoted repo holds commits upstream has never seen. Syncing would
+        // fast-forward them away, which is exactly the loss promotion prevents.
+        if mirror::is_promoted(&self.sql)? {
+            return Response::error(
+                "repo is promoted to primary; demote it after reconciling with upstream",
+                409,
+            );
+        }
         let report = artifacts::sync(&self.sql, &remote, &auth).await?;
         store::set_config(
             &self.sql,

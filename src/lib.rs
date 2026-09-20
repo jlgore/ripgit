@@ -68,6 +68,35 @@ fn check_write_access(actor: &Option<Actor>, repo_owner: &str) -> Option<Result<
     }
 }
 
+/// Config key recording whether a repo may be read anonymously.
+const CFG_VISIBILITY: &str = "visibility";
+
+/// Whether this repo is private. Absent config means public, which keeps
+/// repos that predate visibility tracking readable as they were.
+fn is_private(sql: &SqlStorage) -> Result<bool> {
+    Ok(store::get_config(sql, CFG_VISIBILITY)?.as_deref() == Some("private"))
+}
+
+/// Returns a 404 if the caller may not read this repo, else None.
+///
+/// A private mirror answers as though it does not exist rather than refusing:
+/// the name of a private repo is itself something the upstream keeps back, and
+/// a 403 would confirm it.
+fn check_read_access(
+    sql: &SqlStorage,
+    actor: &Option<Actor>,
+    repo_owner: &str,
+) -> Option<Result<Response>> {
+    match is_private(sql) {
+        Ok(false) => None,
+        Ok(true) => match actor {
+            Some(a) if a.display_name == repo_owner => None,
+            _ => Some(Response::error("Not Found", 404)),
+        },
+        Err(e) => Some(Err(e)),
+    }
+}
+
 /// 401 with WWW-Authenticate so git knows to prompt for / retry with credentials.
 fn unauthorized_401() -> Result<Response> {
     let mut resp = Response::error("Unauthorized: sign in to push", 401)?;
@@ -122,7 +151,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         let owner = parts[0];
         let actor_name = actor_from_request(&req).map(|a| a.display_name);
         let url = req.url()?;
-        let repos = list_repos(&env, owner).await;
+        let repos = list_repos(&env, owner, actor_name.as_deref() == Some(owner)).await;
         let selection = match negotiate_or_response(
             &req,
             &[Representation::Html, Representation::Markdown],
@@ -220,6 +249,12 @@ impl DurableObject for Repository {
         let actor = actor_from_request(&req);
         let actor_name = actor.as_ref().map(|a| a.display_name.as_str());
 
+        // Gate reads before dispatch, so every route -- pages, API, and the git
+        // protocol alike -- is covered by one check rather than each remembering.
+        if let Some(resp) = check_read_access(&self.sql, &actor, owner) {
+            return resp;
+        }
+
         match (req.method(), action) {
             // -- Git smart HTTP protocol --
             (Method::Get, "info") if parts.get(3) == Some(&"refs") => {
@@ -258,9 +293,20 @@ impl DurableObject for Repository {
                 // On successful push, register the repo in the REGISTRY KV so
                 // the owner profile page can list it. Best-effort: never fail the push.
                 if resp.status_code() == 200 {
+                    // The mirror agent forwards the upstream's visibility from
+                    // its signed OIDC claim. Absent for ordinary pushes, which
+                    // leaves whatever the repo already had.
+                    if let Ok(Some(vis)) = req.headers().get("X-Ripgit-Repo-Visibility") {
+                        let vis = if vis == "public" { "public" } else { "private" };
+                        store::set_config(&self.sql, CFG_VISIBILITY, vis)?;
+                    }
+
+                    // Visibility is mirrored into the registry so the owner
+                    // profile can filter without waking every repo to ask.
                     let key = format!("repo:{}/{}", owner, repo_name);
+                    let value = if is_private(&self.sql)? { "private" } else { "public" };
                     if let Ok(kv) = self.env.kv("REGISTRY") {
-                        if let Ok(builder) = kv.put(&key, "1") {
+                        if let Ok(builder) = kv.put(&key, value) {
                             let _ = builder.execute().await;
                         }
                     }
@@ -1463,18 +1509,28 @@ fn is_hex40(s: &str) -> bool {
 /// List repos registered in the REGISTRY KV for the given owner.
 /// Keys are stored as "repo:{owner}/{repo}".
 /// Returns an empty list if the KV binding is unavailable or the list fails.
-async fn list_repos(env: &Env, owner: &str) -> Vec<String> {
+async fn list_repos(env: &Env, owner: &str, viewer_is_owner: bool) -> Vec<String> {
     let prefix = format!("repo:{}/", owner);
     let kv = match env.kv("REGISTRY") {
         Ok(kv) => kv,
         Err(_) => return vec![],
     };
-    match kv.list().prefix(prefix.clone()).execute().await {
-        Ok(result) => result
-            .keys
-            .into_iter()
-            .map(|k| k.name[prefix.len()..].to_string())
-            .collect(),
-        Err(_) => vec![],
+    let Ok(result) = kv.list().prefix(prefix.clone()).execute().await else {
+        return vec![];
+    };
+
+    let mut repos = Vec::new();
+    for key in result.keys {
+        let name = key.name[prefix.len()..].to_string();
+        if viewer_is_owner {
+            repos.push(name);
+            continue;
+        }
+        // Entries written before visibility was tracked hold "1" and are public.
+        match kv.get(&key.name).text().await {
+            Ok(Some(v)) if v == "private" => continue,
+            _ => repos.push(name),
+        }
     }
+    repos
 }

@@ -36,6 +36,8 @@ export interface GitHubOidcClaims {
   actor?: string;
   /** Subject, e.g. "repo:owner/repo:ref:refs/heads/main". */
   sub?: string;
+  /** "public", "private" or "internal" — signed, so it can be trusted. */
+  repository_visibility?: string;
 }
 
 export class OidcError extends Error {}

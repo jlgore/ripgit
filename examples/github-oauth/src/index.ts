@@ -1159,6 +1159,9 @@ async function handleOidcExchange(
       // mechanism that delivers commits.
       scopes: ["push", "mirror"],
       repoScope: grant.target,
+      // Anything not explicitly public is treated as private, so "internal"
+      // and an absent claim both fail closed rather than publishing a mirror.
+      repoVisibility: claims.repository_visibility === "public" ? "public" : "private",
     };
     await env.OAUTH_KV.put(`agent:${token}`, JSON.stringify(actor), {
       expirationTtl: MIRROR_TOKEN_TTL,
@@ -1235,7 +1238,7 @@ function forwardToRipgit(
   // would walk past the mirror divergence guard. Nothing from the public
   // internet may reach ripgit under these names.
   for (const name of [...headers.keys()]) {
-    if (name.toLowerCase().startsWith("x-ripgit-actor")) {
+    if (name.toLowerCase().startsWith("x-ripgit-")) {
       headers.delete(name);
     }
   }
@@ -1256,6 +1259,9 @@ function forwardToRipgit(
     headers.set("X-Ripgit-Actor-Scopes", actor.scopes.join(","));
     if (actor.ownerActorId) {
       headers.set("X-Ripgit-Actor-Owner", actor.ownerActorId);
+    }
+    if (actor.repoVisibility) {
+      headers.set("X-Ripgit-Repo-Visibility", actor.repoVisibility);
     }
   }
   headers.delete("Authorization");

@@ -14,6 +14,9 @@ export interface ActorProps {
   // Mirror agents only: the single "owner/repo" path this credential may touch.
   // Enforced on every proxied request, since ripgit's own check is owner-wide.
   repoScope?: string;
+  // Mirror agents only: the upstream's visibility, taken from the signed OIDC
+  // claim. Tells ripgit whether the mirror it is about to receive is public.
+  repoVisibility?: "public" | "private";
 }
 
 // ---------------------------------------------------------------------------

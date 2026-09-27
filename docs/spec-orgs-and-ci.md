@@ -1,6 +1,6 @@
 # Spec: organizations, teams, and CI
 
-Status: draft (2026-09-27)
+Status: draft (2026-09-27; Part 1 revised the same day to use better-auth)
 Branch baseline: `artifacts-backend` @ `3895a48`
 
 Two features stand between ripgit and replacing GitHub for a small team:
@@ -58,82 +58,68 @@ from upstream. Neither feature below is expected to need fork changes; see
 - Renaming users, orgs, or repos. DO names are permanent (`{owner}/{repo}`);
   see AGENTS.md.
 
-### Identity: authorize on IDs, not names
+### Decision: better-auth (TypeScript) in the auth worker
 
-Today ownership follows the GitHub **username**. A GitHub rename would
-silently hand a namespace to whoever next registers the old name.
+Identity, sessions, orgs, teams, memberships, invitations and API keys come
+from [better-auth](https://www.better-auth.com) running in the auth worker,
+which is already TypeScript. It replaces the hand-rolled OAuth, session and
+agent-token code in `examples/github-oauth/src/index.ts`.
 
-- Every account is keyed by `actorId` (`github:12345`), already sent as
-  `X-Ripgit-Actor-Id` but currently ignored by ripgit.
-- A namespace is claimed by an account ID once, and stays claimed.
-- Agent tokens resolve to their owner's account ID (`X-Ripgit-Actor-Owner`),
-  then are narrowed by the token's scopes.
+Why not better-auth-rs (evaluated 2026-09-27 at 1.0.0-alpha.3): it does not
+compile for `wasm32-unknown-unknown`. `better-auth-api` hard-depends on
+`webauthn-rs` → OpenSSL, `better-auth-core` needs tokio `full` (mio), and every
+store trait is `Send + Sync`, which Workers bindings are not. It is also alpha
+with no teams yet. It mirrors better-auth's API and wire format, so moving the
+auth worker to Rust later stays open.
 
-### Storage: D1 `DIRECTORY`
+Plugins used:
 
-Membership is global and relational (one team change touches many repos), so
-it does not belong in any single repo DO. Add a D1 database bound to the ripgit
-worker as `DIRECTORY`.
+| Need | better-auth |
+|---|---|
+| GitHub sign-in | `socialProviders.github` |
+| Orgs, teams, invitations, org roles | `organization({ teams: { enabled: true } })` |
+| Agent tokens, git HTTP passwords, org-owned bot keys | `@better-auth/api-key` |
+| CLI / agent login without a browser session (later) | device authorization plugin |
+
+Stays custom in the auth worker: the GitHub Actions OIDC exchange for mirror
+tokens, and GitHub org sync.
+
+### Division of ownership
+
+One D1 database, bound as `AUTH_DB` in the auth worker and `DIRECTORY` in
+ripgit.
+
+- **better-auth owns** its tables (`user`, `session`, `account`,
+  `verification`, `organization`, `member`, `invitation`, `team`,
+  `teamMember`, `apikey`) and is the only writer. Schema comes from
+  `npx @better-auth/cli generate`; the better-auth version is pinned exactly,
+  because ripgit reads these tables.
+- **ripgit owns** only what is git-specific, prefixed `ripgit_`, and applied
+  with `wrangler d1 migrations`:
 
 ```sql
-CREATE TABLE accounts (
-  id          TEXT PRIMARY KEY,           -- "github:12345"
-  login       TEXT NOT NULL,              -- current display login
-  created_at  INTEGER NOT NULL
-);
-
 -- One row per /:owner/ segment. Claimed once, never reassigned.
-CREATE TABLE namespaces (
+CREATE TABLE ripgit_namespaces (
   name        TEXT PRIMARY KEY,           -- lowercase URL segment
   kind        TEXT NOT NULL,              -- 'user' | 'org'
-  account_id  TEXT,                       -- kind='user': owning account
-  org_id      TEXT,                       -- kind='org'
+  user_id     TEXT,                       -- kind='user': better-auth user.id
+  org_id      TEXT,                       -- kind='org': better-auth organization.id
   created_at  INTEGER NOT NULL
 );
 
-CREATE TABLE orgs (
-  id            TEXT PRIMARY KEY,
-  name          TEXT NOT NULL UNIQUE REFERENCES namespaces(name),
-  github_org    TEXT,                     -- linked GitHub org login, if synced
-  created_at    INTEGER NOT NULL
-);
-
-CREATE TABLE org_members (
-  org_id      TEXT NOT NULL,
-  account_id  TEXT NOT NULL,
-  role        TEXT NOT NULL,              -- 'owner' | 'member'
-  source      TEXT NOT NULL,              -- 'native' | 'github'
-  PRIMARY KEY (org_id, account_id)
-);
-
-CREATE TABLE teams (
-  id            TEXT PRIMARY KEY,
-  org_id        TEXT NOT NULL,
-  slug          TEXT NOT NULL,
-  github_team   TEXT,                     -- linked GitHub team slug
-  UNIQUE (org_id, slug)
-);
-
-CREATE TABLE team_members (
-  team_id     TEXT NOT NULL,
-  account_id  TEXT NOT NULL,
-  source      TEXT NOT NULL,              -- 'native' | 'github'
-  PRIMARY KEY (team_id, account_id)
-);
-
--- Grants on a repo, to a team or a single account.
-CREATE TABLE repo_grants (
+-- Grants on a repo, to a team or a single user.
+CREATE TABLE ripgit_repo_grants (
   repo          TEXT NOT NULL,            -- "owner/name"
-  grantee_kind  TEXT NOT NULL,            -- 'team' | 'account'
-  grantee_id    TEXT NOT NULL,
+  grantee_kind  TEXT NOT NULL,            -- 'team' | 'user'
+  grantee_id    TEXT NOT NULL,            -- team.id | user.id
   role          TEXT NOT NULL,            -- 'read' | 'triage' | 'write' | 'admin'
   PRIMARY KEY (repo, grantee_kind, grantee_id)
 );
 
--- Org-wide default for members with no explicit grant.
-CREATE TABLE org_settings (
+CREATE TABLE ripgit_org_settings (
   org_id              TEXT PRIMARY KEY,
-  default_repo_role   TEXT NOT NULL DEFAULT 'read'   -- 'none' | 'read' | 'write'
+  default_repo_role   TEXT NOT NULL DEFAULT 'read',  -- 'none' | 'read' | 'write'
+  github_org          TEXT                           -- linked GitHub org, if synced
 );
 ```
 
@@ -141,6 +127,22 @@ Repo **visibility** stays in the repo DO config (already built), gaining a
 third value: `internal` = readable by any member of the owning org. The OIDC
 mirror path currently fails closed on GitHub's `internal`; with orgs it maps to
 `internal` directly.
+
+### Identity: authorize on IDs, not names
+
+Today ownership follows the GitHub **username**; a GitHub rename would
+silently hand a namespace to whoever next registers the old name.
+
+- The actor is the better-auth `user.id`, sent as `X-Ripgit-Actor-Id`. The
+  GitHub numeric ID lives in `account` (`providerId = 'github'`,
+  `accountId = '<id>'`), which is how existing owners are matched up.
+- A user namespace is claimed on first sign-in (the GitHub login, lowercased)
+  if free. An org namespace is claimed when the org is created: an
+  `organization` create hook inserts into `ripgit_namespaces` and rejects the
+  create if the slug is taken, so users and orgs share one namespace.
+- API keys resolve to their owning user (or org, for org-owned keys), then are
+  narrowed by the key's permissions and optional repo list (generalizing the
+  mirror token's `repoScope`).
 
 ### Roles
 
@@ -154,30 +156,51 @@ mirror path currently fails closed on GitHub's `internal`; with orgs it maps to
 Commenting on and opening issues stays open to any signed-in user on a readable
 repo, as it is today.
 
+Org roles map onto repos: better-auth `owner` and `admin` → repo `admin` on
+every repo in the org; `member` → the org's `default_repo_role`. `member.role`
+can hold several comma-separated roles; take the highest.
+
 ### Resolving a role
 
 ```
 effective_role(actor, owner, repo) =
   if namespace(owner).kind == 'user':
-      admin  if actor.account_id == namespace.account_id
+      admin  if actor.user_id == namespace.user_id
       else max(direct grants on repo)
   if namespace(owner).kind == 'org':
-      admin  if actor is org owner
-      else max(org default_repo_role if member,
-               team grants for teams actor belongs to,
-               direct account grant)
+      admin  if actor's member.role includes owner|admin
+      else max(default_repo_role if member,
+               grants to teams in teamMember for actor,
+               direct user grant)
   then: a public repo floors at 'read' for everyone (including anonymous);
         an internal repo floors at 'read' for org members;
-        then narrow by token scopes (repo:read caps at read, etc.)
+        then narrow by API key permissions and repo list
 ```
 
+One D1 query, roughly:
+
+```sql
+SELECT n.kind, n.user_id, m.role AS org_role, s.default_repo_role,
+       (SELECT group_concat(g.role) FROM ripgit_repo_grants g
+         WHERE g.repo = ?1
+           AND ((g.grantee_kind = 'user' AND g.grantee_id = ?2)
+             OR (g.grantee_kind = 'team' AND g.grantee_id IN
+                  (SELECT tm.teamId FROM teamMember tm WHERE tm.userId = ?2)))) AS grants
+FROM ripgit_namespaces n
+LEFT JOIN member m ON m.organizationId = n.org_id AND m.userId = ?2
+LEFT JOIN ripgit_org_settings s ON s.org_id = n.org_id
+WHERE n.name = ?3;
+```
+
+Column names are better-auth's defaults; confirm against the generated schema
+for the pinned version.
+
 **Where it runs:** in the ripgit Worker entry (`lib.rs::fetch`), before the DO
-is called. The Worker computes the role with one D1 query and sets an internal
-header `X-Ripgit-Role` on the request to the DO. The DO is reachable only from
-the Worker, and the auth worker already strips all inbound `X-Ripgit-*`, so the
-header cannot be forged from outside. The DO needs visibility to finish the
-decision, so the DO applies the visibility floor and returns 404 (not 403) when
-the result is no access, matching today's private-repo behavior.
+is called. The Worker sets an internal header `X-Ripgit-Role` on the request to
+the DO. The DO is reachable only from the Worker, and the auth worker already
+strips all inbound `X-Ripgit-*`, so the header cannot be forged from outside.
+The DO applies the visibility floor (it holds visibility) and returns 404 (not
+403) when the result is no access, matching today's private-repo behavior.
 
 Replace `check_write_access` / `check_read_access` / the issue author-or-owner
 checks with `require(role, Role::Write)`-style calls that read this header.
@@ -185,60 +208,67 @@ Keep one helper so no route re-derives it.
 
 **Latency:** one D1 read per request. Use D1 read replication with the
 Sessions API; membership changes may take a moment to reach replicas, which is
-acceptable. If it is not, cache per-actor membership in the Worker for ~30s.
+acceptable. If it is not, cache per-actor results in the Worker for ~30s.
+
+### Git over HTTP
+
+git sends HTTP Basic auth. The auth worker takes the password as an API key
+(username ignored), verifies it with the api-key plugin, and forwards the
+owning user. Browser sessions keep using the better-auth session cookie.
 
 ### Migration
 
-1. Create `DIRECTORY`. Backfill `namespaces` from REGISTRY KV owner segments as
-   `kind='user'`, `account_id` = the GitHub ID of that login (look up once via
-   the GitHub API; unresolvable names are flagged for manual claim, not
-   guessed).
-2. Ship role resolution behind the old check: if a namespace row is missing,
-   fall back to the display-name comparison. Log every fallback.
-3. When fallbacks reach zero, remove the old path.
-4. New namespaces are claimed at first push (user) or at org creation.
+1. Create the D1 database; run better-auth's schema and ripgit's migrations.
+2. Stand up better-auth in the auth worker beside the old code. Existing
+   browser sessions end; users sign in again with GitHub (same identity, new
+   session).
+3. Backfill `ripgit_namespaces` from REGISTRY KV owner segments as
+   `kind='user'`. On each owner's first better-auth sign-in, match their
+   GitHub ID to the namespace and set `user_id`. Until matched, keep the
+   display-name fallback for that namespace only, and log each use.
+4. Agent tokens in `OAUTH_KV` keep working during a grace period (old lookup as
+   a fallback), while owners reissue them as API keys from the settings page.
+   Then remove the KV path.
+5. Mirror OIDC exchange: unchanged, but mints a short-lived API key (or keeps
+   its KV token) scoped to one repo. Mirror grants move into D1 so org owners
+   can manage them.
+6. When fallbacks reach zero, delete the old OAuth/session/token code.
 
 ### Management surface
 
-In ripgit (the data lives here, not in the auth worker). HTML and markdown
-views like every other page:
+better-auth provides the API, not the pages.
 
-- `POST /orgs` — create org (claims namespace; creator becomes owner).
-- `/:org/settings/members`, `/:org/settings/teams`, `/:org/settings/github`.
-- `/:owner/:repo/settings/access` — grants and visibility.
-- Matching JSON under `/:org/api/...` for agents.
-
-Org creation is open to any signed-in user, or restricted to an allowlist
-while the instance is small (see [Open questions](#open-questions)).
+- **Auth worker** (owns the data): `/settings` for the user's profile and API
+  keys; `/orgs/new`; `/:org/settings/members`, `/teams`, `/invitations`,
+  `/github`. HTML plus markdown views, like today's `/settings`.
+- **ripgit**: `/:owner/:repo/settings/access` for grants and visibility (its
+  own tables), and the owner profile page lists org members and teams read
+  from D1.
+- Org creation is limited to an allowlist while the instance is small (see
+  [Open questions](#open-questions)).
 
 ### GitHub sync
+
+Runs in the auth worker, since that is where the membership tables live.
 
 - An org owner links a ripgit org to a GitHub org and maps teams by slug.
 - Use a **GitHub App** installed on the GitHub org, not user OAuth tokens:
   installation tokens work on a schedule with no user present and survive the
   linking user leaving.
-- Sync writes only rows with `source='github'` and never touches `native` rows.
-  A member removed on GitHub is removed here; someone added natively stays.
-- Runs: on link, on a schedule (reuse the existing cron + `MirrorWorkflow`
-  pattern: a `DirectorySyncWorkflow` with one durable step per org), and
-  optionally on GitHub `membership`/`organization` webhooks.
+- Provenance: add a `source` field (`'native' | 'github'`) to `member` and
+  `teamMember` via the organization plugin's `additionalFields`. Sync writes and
+  removes only `github` rows; someone added in ripgit stays.
+- Runs on link, on the auth worker's cron trigger, and optionally on GitHub
+  `membership`/`organization` webhooks. A synced GitHub user with no ripgit
+  account yet is kept as pending and becomes a member on first sign-in.
 - If GitHub is unreachable, sync fails and the last-synced state stays in
   force. Nothing is removed on error.
-- Rename: `accounts.login` is refreshed at login and on sync; namespaces are not
-  renamed.
-
-### Auth worker changes
-
-- Stop treating `ownerActorName` as the authority; always send
-  `X-Ripgit-Actor-Id` and, for agents, `X-Ripgit-Actor-Owner`.
-- Agent tokens may be restricted to a list of namespaces or repos (generalize
-  the mirror token's `repoScope`).
-- Mirror OIDC grants (currently KV owner-trust) should move to `DIRECTORY` in
-  a later pass so an org owner can manage them in the org settings.
 
 ### Tests
 
-Extend the Miniflare harness (`tests/helpers/mf.mjs`) with a D1 binding.
+Auth worker: vitest with `@cloudflare/vitest-pool-workers` and a local D1.
+ripgit: extend the Miniflare harness (`tests/helpers/mf.mjs`) with the same D1,
+seeded with better-auth rows.
 
 - Role matrix: each role × each action, for a user repo and an org repo.
 - Visibility: public/private/internal × member/non-member/anonymous, over pages,
@@ -246,8 +276,10 @@ Extend the Miniflare harness (`tests/helpers/mf.mjs`) with a D1 binding.
 - 404 for no access, never 403, on private and internal repos.
 - Forged `X-Ripgit-Role` from outside is ignored (the auth worker strips it;
   also assert ripgit's Worker overwrites it).
+- API key narrowing: a key limited to one repo cannot touch another.
+- Namespace collision: an org cannot take a user's name and vice versa.
 - Sync never deletes `native` rows; a failed sync changes nothing.
-- Migration fallback: legacy repos still work before backfill.
+- Migration fallbacks: an unmatched legacy owner and an old KV token still work.
 
 ---
 
@@ -479,9 +511,9 @@ Verify before relying on them; none are expected to need new fork code.
 
 | Phase | Scope | Done when |
 |---|---|---|
-| 0 | `DIRECTORY` D1, `accounts` + `namespaces`, backfill, `effective_role` behind the legacy fallback, `X-Ripgit-Role` | All existing tests pass with role checks; fallback count is zero |
-| 1 | Orgs, teams, grants, `internal` visibility, settings pages + API | Role and visibility matrix tests pass; an org repo is usable by two people |
-| 2 | GitHub App sync | A GitHub org's teams show up in ripgit and stay in place when sync fails |
+| 0 | Shared D1; better-auth in the auth worker (GitHub sign-in, sessions, API keys) beside the old code; `ripgit_namespaces` backfill; `effective_role` + `X-Ripgit-Role` behind legacy fallbacks | All existing tests pass with role checks; sign-in and git push work through better-auth; fallback count is zero |
+| 1 | Organization plugin with teams, namespace hook, `ripgit_repo_grants`, `internal` visibility, org settings pages (auth worker) and access page (ripgit); remove old auth code | Role and visibility matrix tests pass; an org repo is usable by two people |
+| 2 | GitHub App sync in the auth worker | A GitHub org's teams show up in ripgit and stay in place when sync fails |
 | 3 | CI MVP: ripgit-ci worker, archive endpoint, push trigger, shell steps, logs, Actions page | ripgit's own pipeline builds and tests ripgit on push |
 | 4 | CI: PR triggers + PR checks, TS `fn` steps, matrix, secrets, cancel/re-run | A PR shows passing checks before merge |
 | 5 | Required checks + branch protection (also closes the force-push gap in TODOS.md) | Merge is blocked on a failing required check |
@@ -503,3 +535,8 @@ Phases 0–2 and 3 can overlap once Phase 0 lands: CI MVP only needs
 4. **Pipeline naming** — `.ripgit/pipelines/` vs `.ripgit/workflows/`.
 5. **Mirrored repos** — should mirrors run CI? Proposed: off by default;
    GitHub already ran it, and a promoted mirror turns it on.
+6. **Agent token migration** — reissue as API keys during a grace period
+   (proposed), or import existing KV tokens into the `apikey` table so nothing
+   breaks? Importing depends on better-auth's key hashing format.
+7. **Auth worker location** — it is still `examples/github-oauth`. With
+   better-auth it becomes a required part of ripgit; move it to `auth/`?

@@ -29,20 +29,30 @@ service = "ripgit"
 # Public origin of this worker. better-auth builds its OAuth callback from it.
 BETTER_AUTH_URL = "https://ripgit-auth.sharted.workers.dev"
 
-# GitHub OAuth App client ID. The app's callback URL must be
-#   {BETTER_AUTH_URL}/api/auth/callback/github
-#   (local dev: http://localhost:8787/api/auth/callback/github)
-GITHUB_CLIENT_ID = "Ov23lizgetI6GvNY2McM"
-
 # Comma-separated GitHub logins allowed to create organizations.
 ORG_CREATORS = "jlgore"
-
-# Secrets (wrangler secret put NAME):
-#   GITHUB_CLIENT_SECRET  — the OAuth App's client secret
-#   BETTER_AUTH_SECRET    — 32+ random bytes, e.g. `openssl rand -base64 32`
 
 # Audience that GitHub Actions OIDC tokens must carry when exchanging for a
 # mirror token. Pin this to THIS deployment's URL. GitHub's default audience is
 # the repo owner's URL, which every service that owner runs shares — a token
 # minted for one of them would otherwise be replayable here.
 OIDC_AUDIENCE = "https://ripgit-auth.sharted.workers.dev"
+
+# Sign-in uses the ripgit GitHub App. Its callback URL must be
+#   {BETTER_AUTH_URL}/api/auth/callback/github
+#   (local dev: http://localhost:8787/api/auth/callback/github)
+# Credentials come from the account's Secrets Store.
+[[secrets_store_secrets]]
+binding = "GITHUB_CLIENT_ID"
+store_id = "7050b29b966246fa8d5620b195bb9c8b"
+secret_name = "ripgit_github_app_client_id"
+
+[[secrets_store_secrets]]
+binding = "GITHUB_CLIENT_SECRET"
+store_id = "7050b29b966246fa8d5620b195bb9c8b"
+secret_name = "ripgit_github_client_secret"
+
+# BETTER_AUTH_SECRET (32+ random bytes) is not in the Secrets Store yet; set it
+# as a Worker secret:
+#   openssl rand -base64 32 | wrangler secret put BETTER_AUTH_SECRET
+# or add it to the store and bind it here like the two above.

@@ -104,11 +104,16 @@ sibling.
 - `OAUTH_KV` - KV for the GitHub OIDC key cache, mirror enrollment, and short-lived mirror tokens
 - `RIPGIT` - Service Binding that points at the main ripgit Worker
 - `BETTER_AUTH_URL` - this worker's public origin (`[vars]`)
-- `GITHUB_CLIENT_ID` - GitHub OAuth App client ID (`[vars]`)
+- `GITHUB_CLIENT_ID` - the GitHub App's client ID, from the Secrets Store (`ripgit_github_app_client_id`)
 - `ORG_CREATORS` - comma-separated GitHub logins allowed to create organizations (`[vars]`)
 - `OIDC_AUDIENCE` - this deployment's URL, required for GitHub Actions mirroring (`[vars]`)
-- `GITHUB_CLIENT_SECRET` - secret: `wrangler secret put GITHUB_CLIENT_SECRET`
-- `BETTER_AUTH_SECRET` - secret, 32+ random bytes: `openssl rand -base64 32 | wrangler secret put BETTER_AUTH_SECRET`
+- `GITHUB_CLIENT_SECRET` - the GitHub App's client secret, from the Secrets Store (`ripgit_github_client_secret`)
+- `BETTER_AUTH_SECRET` - 32+ random bytes: `openssl rand -base64 32 | wrangler secret put BETTER_AUTH_SECRET` (or add it to the Secrets Store and bind it like the two above)
+
+Each secret may be a Secrets Store binding or a plain string (a Worker secret or
+`.dev.vars`); `readSecret` in `src/auth.ts` accepts either. A missing one fails
+requests with a message naming it, and is picked up without a redeploy once
+added.
 
 ## Database
 
@@ -121,20 +126,21 @@ After changing `src/auth.ts` or bumping better-auth:
 npm run schema:generate    # prints the full schema; diff it into a new migration
 ```
 
-## GitHub OAuth App Setup
+## GitHub App Setup
 
-Create a GitHub OAuth App at <https://github.com/settings/applications/new>.
+Sign-in uses the ripgit GitHub App (the same App org sync will use). In the
+App's settings, under "Identifying and authorizing users":
 
-- Homepage URL: your deployed auth worker URL, for example `https://git-auth.example.workers.dev`
-- Authorization callback URL: `https://git-auth.example.workers.dev/api/auth/callback/github`
+- Callback URL: `https://git-auth.example.workers.dev/api/auth/callback/github`
 - Local dev callback URL: `http://localhost:8787/api/auth/callback/github`
+- Leave "Request user authorization (OAuth) during installation" off.
 
 ## Local Development
 
 ```bash
 cd auth
 npm install
-cp .dev.vars.example .dev.vars          # fill in the two secrets
+cp .dev.vars.example .dev.vars          # set BETTER_AUTH_SECRET; seed the local store as it says
 npx wrangler d1 migrations apply ripgit-directory --local
 npm run dev:full
 ```
@@ -159,10 +165,10 @@ cd auth
 wrangler d1 migrations apply ripgit-directory --remote
 ```
 
-Set the secrets, then deploy ripgit first and the auth worker second:
+The GitHub App's client ID and secret come from the Secrets Store. Set the
+remaining secret, then deploy ripgit first and the auth worker second:
 
 ```bash
-wrangler secret put GITHUB_CLIENT_SECRET
 openssl rand -base64 32 | wrangler secret put BETTER_AUTH_SECRET
 cd .. && wrangler deploy
 cd auth && wrangler deploy

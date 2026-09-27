@@ -46,13 +46,16 @@ import {
 const USER_SCOPES = ["repo:read", "repo:write", "issue:write", "pr:merge"];
 
 // One better-auth instance per isolate: env is stable for an isolate's life.
-const authInstances = new WeakMap<Env, Auth>();
+// Building it reads secrets, so it is async; a failed build is not cached, so
+// a secret added after deploy is picked up on the next request.
+const authInstances = new WeakMap<Env, Promise<Auth>>();
 
-function getAuth(env: Env): Auth {
+function getAuth(env: Env): Promise<Auth> {
   let auth = authInstances.get(env);
   if (!auth) {
     auth = createAuth(env);
     authInstances.set(env, auth);
+    auth.catch(() => authInstances.delete(env));
   }
   return auth;
 }
@@ -67,7 +70,7 @@ export default {
 
 async function mainHandler(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const auth = getAuth(env);
+  const auth = await getAuth(env);
 
   if (url.pathname.startsWith("/api/auth/")) return auth.handler(request);
 

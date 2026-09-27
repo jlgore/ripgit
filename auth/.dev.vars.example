@@ -1,4 +1,8 @@
-GITHUB_CLIENT_SECRET=
 BETTER_AUTH_SECRET=
 # Local dev: point better-auth at the local worker, not the deployment.
 BETTER_AUTH_URL=http://localhost:8787
+# GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are Secrets Store bindings (see
+# wrangler.toml). Locally, wrangler reads a local store; seed it once:
+#   wrangler secrets-store secret create 7050b29b966246fa8d5620b195bb9c8b \
+#     --name ripgit_github_app_client_id --value <client id> --scopes workers
+#   (and the same for ripgit_github_client_secret)

@@ -14,7 +14,7 @@ import { apiKey } from "@better-auth/api-key";
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { APIError } from "better-auth/api";
 import { organization } from "better-auth/plugins";
-import type { Env } from "./types";
+import type { Env, Secret } from "./types";
 
 /**
  * Owner names that can never be claimed, because the auth worker or ripgit
@@ -60,7 +60,7 @@ async function namespaceTaken(db: D1Database, name: string): Promise<boolean> {
 }
 
 /** Comma-separated GitHub logins allowed to create organizations. */
-function orgCreators(env: Pick<Env, "ORG_CREATORS">): Set<string> {
+function orgCreators(env: Pick<AuthConfig, "ORG_CREATORS">): Set<string> {
   return new Set(
     (env.ORG_CREATORS ?? "")
       .split(",")
@@ -69,15 +69,18 @@ function orgCreators(env: Pick<Env, "ORG_CREATORS">): Set<string> {
   );
 }
 
+/** Everything authOptions needs, with secrets already read. */
+export interface AuthConfig {
+  BETTER_AUTH_URL: string;
+  BETTER_AUTH_SECRET: string;
+  GITHUB_CLIENT_ID: string;
+  GITHUB_CLIENT_SECRET: string;
+  ORG_CREATORS?: string;
+  AUTH_DB: D1Database;
+}
+
 export function authOptions(
-  env: Pick<
-    Env,
-    | "BETTER_AUTH_URL"
-    | "BETTER_AUTH_SECRET"
-    | "GITHUB_CLIENT_ID"
-    | "GITHUB_CLIENT_SECRET"
-    | "ORG_CREATORS"
-  > & { AUTH_DB: D1Database },
+  env: AuthConfig,
   database: BetterAuthOptions["database"] = env.AUTH_DB,
 ) {
   const db = env.AUTH_DB;
@@ -169,8 +172,33 @@ export function authOptions(
   } satisfies BetterAuthOptions;
 }
 
-export function createAuth(env: Env) {
-  return betterAuth(authOptions(env));
+/** The value of a secret, whether bound from the Secrets Store or as a string. */
+export async function readSecret(name: string, secret: Secret | undefined): Promise<string> {
+  if (typeof secret === "string") return secret;
+  if (!secret) throw new Error(`${name} is not bound`);
+  try {
+    return await secret.get();
+  } catch (err) {
+    throw new Error(`${name} could not be read from the Secrets Store: ${String(err)}`);
+  }
 }
 
-export type Auth = ReturnType<typeof createAuth>;
+export async function createAuth(env: Env) {
+  const [clientId, clientSecret, authSecret] = await Promise.all([
+    readSecret("GITHUB_CLIENT_ID", env.GITHUB_CLIENT_ID),
+    readSecret("GITHUB_CLIENT_SECRET", env.GITHUB_CLIENT_SECRET),
+    readSecret("BETTER_AUTH_SECRET", env.BETTER_AUTH_SECRET),
+  ]);
+  return betterAuth(
+    authOptions({
+      BETTER_AUTH_URL: env.BETTER_AUTH_URL,
+      BETTER_AUTH_SECRET: authSecret,
+      GITHUB_CLIENT_ID: clientId,
+      GITHUB_CLIENT_SECRET: clientSecret,
+      ORG_CREATORS: env.ORG_CREATORS,
+      AUTH_DB: env.AUTH_DB,
+    }),
+  );
+}
+
+export type Auth = Awaited<ReturnType<typeof createAuth>>;

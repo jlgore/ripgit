@@ -24,18 +24,26 @@ export interface Actor {
 // Env — Cloudflare Worker bindings
 // ---------------------------------------------------------------------------
 
+/**
+ * A secret bound either from the Secrets Store (production) or as a plain
+ * string (`wrangler secret put`, or .dev.vars locally). Read with readSecret.
+ */
+export type Secret = string | SecretsStoreSecret;
+
 export interface Env {
   /** better-auth tables plus ripgit_* tables; shared with ripgit as DIRECTORY. */
   AUTH_DB: D1Database;
   /** GitHub OIDC JWKS cache, mirror enrollment, and short-lived mirror tokens. */
   OAUTH_KV: KVNamespace;
   RIPGIT: Fetcher;
-  GITHUB_CLIENT_ID: string;
-  GITHUB_CLIENT_SECRET: string;
+  /** The GitHub App's client ID (Secrets Store: ripgit_github_app_client_id). */
+  GITHUB_CLIENT_ID: Secret;
+  /** The GitHub App's client secret (Secrets Store: ripgit_github_client_secret). */
+  GITHUB_CLIENT_SECRET: Secret;
   /** Public origin of this worker, e.g. https://ripgit-auth.example.workers.dev */
   BETTER_AUTH_URL: string;
-  /** wrangler secret put BETTER_AUTH_SECRET (32+ random bytes) */
-  BETTER_AUTH_SECRET: string;
+  /** 32+ random bytes; signs sessions and encrypts stored OAuth tokens. */
+  BETTER_AUTH_SECRET: Secret;
   /** Comma-separated GitHub logins allowed to create organizations. */
   ORG_CREATORS?: string;
   // Audience that GitHub Actions OIDC tokens must carry. Pin to this

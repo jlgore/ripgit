@@ -4,9 +4,10 @@
 FROM docker.io/cloudflare/sandbox:0.13.0-next.776.1
 
 # Base already has bash, git, curl, tar, node, npm, and bun. Add a C
-# toolchain, and clang/llvm-ar for crates that compile C to wasm.
+# toolchain, clang/llvm-ar for crates that compile C to wasm, and OpenSSL
+# headers for crates that link it (cargo install worker-build does).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential clang llvm pkg-config ca-certificates \
+ && apt-get install -y --no-install-recommends build-essential clang llvm pkg-config libssl-dev ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # Rust, with the wasm target ripgit itself builds for.

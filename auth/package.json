@@ -6,14 +6,17 @@
     "dev": "wrangler dev",
     "dev:full": "wrangler dev -c wrangler.toml -c ../wrangler.toml",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "schema:generate": "node scripts/generate-schema.ts"
   },
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "^0.3.0"
+    "@better-auth/api-key": "1.7.6",
+    "better-auth": "1.7.6"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250224.0",
     "typescript": "^5.7.3",
     "wrangler": "^4.0.0"
-  }
+  },
+  "type": "module"
 }

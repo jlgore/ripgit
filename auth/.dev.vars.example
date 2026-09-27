@@ -1,2 +1,4 @@
 GITHUB_CLIENT_SECRET=
-SESSION_SECRET=
+BETTER_AUTH_SECRET=
+# Local dev: point better-auth at the local worker, not the deployment.
+BETTER_AUTH_URL=http://localhost:8787

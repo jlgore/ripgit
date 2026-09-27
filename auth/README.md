@@ -1,18 +1,31 @@
-# GitHub OAuth Auth Worker
+# ripgit Auth Worker
 
-This example Worker sits in front of ripgit, handles GitHub OAuth, issues browser session cookies, mints long-lived tokens, and forwards trusted `X-Ripgit-Actor-*` headers to the main ripgit Worker through a Service Binding.
+Sits in front of ripgit and answers "who is this?". Identity comes from
+[better-auth](https://www.better-auth.com) (`src/auth.ts`): GitHub sign-in,
+browser sessions, organizations and teams, and API keys, all stored in the
+`ripgit-directory` D1 database. The worker forwards each request to ripgit
+through a Service Binding with trusted `X-Ripgit-Actor-*` headers; ripgit reads
+the same database to decide what that actor may do (`src/authz.rs`).
 
 ## What It Does
 
+- `* /api/auth/*` - better-auth: OAuth callback, sessions, organizations, teams, API keys
 - `GET /` - landing page for browsers plus text mode for curl/agents
-- `GET /settings` - token management page after sign-in plus text mode for curl/agents
-- `GET /login` / `GET /logout` - browser login/logout flow
-- `GET /oauth/authorize` / `POST /oauth/token` - OAuth provider flow for programmatic clients
+- `GET /login` / `GET /logout` - browser sign-in/sign-out (`?next=` a same-origin path)
+- `GET /settings` - API key management after sign-in plus text mode for curl/agents
+- `POST /settings/tokens` - create an API key (shown once)
+- `POST /settings/tokens/:id/revoke` - revoke an API key
 - `POST /oidc/github/exchange` - trade a GitHub Actions OIDC token for a short-lived, repo-scoped push token
-- `POST /settings/tokens` - create a long-lived token
-- `POST /settings/tokens/:id/revoke` - revoke a long-lived token
 
 Everything else is forwarded to ripgit.
+
+On first sign-in a user claims the owner namespace matching their GitHub login
+(`ripgit_namespaces`). Organizations claim their slug when created, from the
+same pool, so a user and an org can never share a name, and a slug can never
+change. Only logins listed in `ORG_CREATORS` may create organizations.
+
+API keys are sent as `Authorization: Bearer KEY` or as the password of an
+HTTPS git remote (the username is ignored).
 
 ## Mirroring From GitHub Without A Long-Lived Secret
 
@@ -74,89 +87,84 @@ refuses to run at all when `OIDC_AUDIENCE` is unset rather than falling back.
 
 ### Scope Enforcement
 
-ripgit's own ownership check is owner-wide: an actor named `jlgore` may write to
-any repo under `/jlgore/`. Mirror tokens carry a `repoScope`, and the auth worker
-rejects any proxied request whose path does not match it, so a workflow in one
-repo cannot push to a sibling.
+A mirror token carries a `repoScope`. The auth worker rejects any proxied
+request whose path does not match it, and ripgit grants a mirror agent write
+access to that one repo only, so a workflow in one repo cannot push to a
+sibling.
 
 ## Required Bindings And Secrets
 
-Set these in `wrangler.toml` or as Worker secrets:
-
-- `GITHUB_CLIENT_ID` - GitHub OAuth App client ID (`[vars]`)
-- `GITHUB_CLIENT_SECRET` - GitHub OAuth App client secret (`wrangler secret put GITHUB_CLIENT_SECRET`)
-- `SESSION_SECRET` - random 32+ character secret for signing browser sessions (`wrangler secret put SESSION_SECRET`)
-- `OIDC_AUDIENCE` - this deployment's URL, required for GitHub Actions mirroring (`[vars]`)
-- `OAUTH_KV` - KV namespace used for OAuth state, issued tokens, and token indexes
+- `AUTH_DB` - the `ripgit-directory` D1 database. ripgit binds the same database as `DIRECTORY`.
+- `OAUTH_KV` - KV for the GitHub OIDC key cache, mirror enrollment, and short-lived mirror tokens
 - `RIPGIT` - Service Binding that points at the main ripgit Worker
+- `BETTER_AUTH_URL` - this worker's public origin (`[vars]`)
+- `GITHUB_CLIENT_ID` - GitHub OAuth App client ID (`[vars]`)
+- `ORG_CREATORS` - comma-separated GitHub logins allowed to create organizations (`[vars]`)
+- `OIDC_AUDIENCE` - this deployment's URL, required for GitHub Actions mirroring (`[vars]`)
+- `GITHUB_CLIENT_SECRET` - secret: `wrangler secret put GITHUB_CLIENT_SECRET`
+- `BETTER_AUTH_SECRET` - secret, 32+ random bytes: `openssl rand -base64 32 | wrangler secret put BETTER_AUTH_SECRET`
 
-`workers-oauth-provider` also injects the `OAUTH_PROVIDER` helper at runtime.
+## Database
+
+`migrations/0001_better_auth.sql` is generated from `src/auth.ts` by
+better-auth's own migration planner; `0002_ripgit.sql` holds ripgit's tables.
+better-auth is pinned to an exact version because ripgit reads its tables.
+After changing `src/auth.ts` or bumping better-auth:
+
+```bash
+npm run schema:generate    # prints the full schema; diff it into a new migration
+```
 
 ## GitHub OAuth App Setup
 
 Create a GitHub OAuth App at <https://github.com/settings/applications/new>.
 
 - Homepage URL: your deployed auth worker URL, for example `https://git-auth.example.workers.dev`
-- Authorization callback URL: `https://git-auth.example.workers.dev/oauth/callback`
-- Local dev callback URL: `http://localhost:8787/oauth/callback`
+- Authorization callback URL: `https://git-auth.example.workers.dev/api/auth/callback/github`
+- Local dev callback URL: `http://localhost:8787/api/auth/callback/github`
 
 ## Local Development
-
-From the repo root:
 
 ```bash
 cd auth
 npm install
+cp .dev.vars.example .dev.vars          # fill in the two secrets
+npx wrangler d1 migrations apply ripgit-directory --local
 npm run dev:full
 ```
 
-That runs:
-
-- the auth worker on `http://localhost:8787`
-- the main ripgit Worker through the local Service Binding declared in `wrangler.toml`
-
-Then:
-
-1. Visit `http://localhost:8787`
-2. Sign in with GitHub
-3. Open `http://localhost:8787/settings`
-4. Generate a token
-5. Push a repo with that token
-
-Example push:
+That runs the auth worker on `http://localhost:8787` with ripgit behind it
+through the local Service Binding. Then sign in at `http://localhost:8787`,
+create an API key at `/settings`, and push:
 
 ```bash
-git remote add origin http://USERNAME:TOKEN@localhost:8787/USERNAME/my-project
+git remote add origin http://USERNAME:KEY@localhost:8787/USERNAME/my-project
 git push origin main
 ```
 
 ## Deployment
 
-Create the KV namespace and fill the IDs into `auth/wrangler.toml`:
+Create the database, put its ID into both `auth/wrangler.toml` (`AUTH_DB`) and
+the root `wrangler.toml` (`DIRECTORY`), and apply the migrations:
 
 ```bash
-wrangler kv namespace create OAUTH_KV
-wrangler kv namespace create OAUTH_KV --preview
+wrangler d1 create ripgit-directory
+cd auth
+wrangler d1 migrations apply ripgit-directory --remote
 ```
 
-Set the secrets:
+Set the secrets, then deploy ripgit first and the auth worker second:
 
 ```bash
 wrangler secret put GITHUB_CLIENT_SECRET
-wrangler secret put SESSION_SECRET
+openssl rand -base64 32 | wrangler secret put BETTER_AUTH_SECRET
+cd .. && wrangler deploy
+cd auth && wrangler deploy
 ```
 
-Deploy ripgit first, then the auth worker:
-
-```bash
-wrangler deploy
-cd auth
-wrangler deploy
-```
-
-Make sure the `[[services]]` binding in `auth/wrangler.toml` points at the deployed ripgit Worker name.
-
-After deployment, update the GitHub OAuth App callback URL to your deployed auth worker URL.
+Make sure the `[[services]]` binding in `auth/wrangler.toml` points at the
+deployed ripgit Worker name, and that the GitHub OAuth App's callback URL is
+`{BETTER_AUTH_URL}/api/auth/callback/github`.
 
 ## Text Mode
 

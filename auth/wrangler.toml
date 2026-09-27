@@ -3,10 +3,18 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# KV namespace for OAuth token storage (workers-oauth-provider uses this)
-# After creating, fill in the IDs below:
-#   wrangler kv namespace create OAUTH_KV
-#   wrangler kv namespace create OAUTH_KV --preview
+# D1 database for better-auth (users, sessions, orgs, teams, API keys) and
+# ripgit's namespace and grant tables. ripgit binds the same database as
+# DIRECTORY. Create once and fill in the ID:
+#   wrangler d1 create ripgit-directory
+#   wrangler d1 migrations apply ripgit-directory --remote
+[[d1_databases]]
+binding = "AUTH_DB"
+database_name = "ripgit-directory"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# KV: GitHub OIDC JWKS cache, mirror enrollment, short-lived mirror tokens.
 [[kv_namespaces]]
 binding = "OAUTH_KV"
 id = "a643f207be5045f49fb9316b227456f5"
@@ -18,18 +26,20 @@ binding = "RIPGIT"
 service = "ripgit"
 
 [vars]
-# GitHub OAuth App client ID.
-# Create an app at https://github.com/settings/applications/new
-#   Homepage URL:            https://your-worker.workers.dev
-#   Authorization callback:  https://your-worker.workers.dev/oauth/callback
-#   (local dev callback:     http://localhost:8787/oauth/callback)
+# Public origin of this worker. better-auth builds its OAuth callback from it.
+BETTER_AUTH_URL = "https://ripgit-auth.sharted.workers.dev"
+
+# GitHub OAuth App client ID. The app's callback URL must be
+#   {BETTER_AUTH_URL}/api/auth/callback/github
+#   (local dev: http://localhost:8787/api/auth/callback/github)
 GITHUB_CLIENT_ID = "Ov23lizgetI6GvNY2McM"
 
-# GitHub OAuth App client secret — set as a secret, not a var:
-#   wrangler secret put GITHUB_CLIENT_SECRET
+# Comma-separated GitHub logins allowed to create organizations.
+ORG_CREATORS = "jlgore"
 
-# Random secret for signing session cookies (any 32+ char string):
-#   wrangler secret put SESSION_SECRET
+# Secrets (wrangler secret put NAME):
+#   GITHUB_CLIENT_SECRET  — the OAuth App's client secret
+#   BETTER_AUTH_SECRET    — 32+ random bytes, e.g. `openssl rand -base64 32`
 
 # Audience that GitHub Actions OIDC tokens must carry when exchanging for a
 # mirror token. Pin this to THIS deployment's URL. GitHub's default audience is

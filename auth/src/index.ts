@@ -1,58 +1,34 @@
 /**
- * ripgit auth worker — GitHub OAuth example
+ * ripgit auth worker
  *
- * Access model:
- *   Anonymous              → read-only (browse, clone, search)
- *   Authenticated          → read + open issues/PRs on any repo
- *   Authenticated + owner  → write (push, merge, admin) on your own repos
+ * Identity comes from better-auth (see ./auth.ts): GitHub sign-in, browser
+ * sessions, organizations and teams, and API keys, all stored in D1. This
+ * worker resolves who the caller is, then forwards to ripgit with trusted
+ * X-Ripgit-Actor-* headers. ripgit decides what that caller may do.
  *
  * Routes handled here (everything else forwarded to ripgit):
- *   GET  /               → auth landing page (HTML or text mode)
- *   GET  /login          → start GitHub OAuth login, ?next= redirect after
- *   GET  /logout         → clear session cookie
- *   GET  /settings       → token management page (HTML or text mode, requires login)
- *   POST /settings/tokens                → create access token
- *   POST /settings/tokens/:id/revoke     → revoke access token
- *   GET  /oauth/authorize → OAuth provider flow (programmatic clients)
- *   GET  /oauth/callback  → unified GitHub callback
- *   POST /oauth/token     → token exchange (OAuthProvider internal)
- *   *    /admin/*         → agent management API (requires admin scope)
+ *   *    /api/auth/*     → better-auth (OAuth callback, sessions, orgs, API keys)
+ *   GET  /               → landing page (HTML or text mode)
+ *   GET  /login          → start GitHub sign-in, ?next= redirect after
+ *   GET  /logout         → end the session
+ *   GET  /settings       → API key management (HTML or text mode, requires login)
+ *   POST /settings/tokens                → create an API key
+ *   POST /settings/tokens/:id/revoke     → revoke an API key
+ *   POST /oidc/github/exchange           → GitHub Actions OIDC → mirror token
  *
- * Setup:
- *   1. Create a GitHub OAuth App (https://github.com/settings/applications/new)
- *      Callback URL: https://your-worker.workers.dev/oauth/callback
- *      (local dev:   http://localhost:8787/oauth/callback)
- *   2. wrangler kv namespace create OAUTH_KV  → fill IDs in wrangler.toml
- *   3. wrangler secret put GITHUB_CLIENT_SECRET
- *   4. wrangler secret put SESSION_SECRET  (any random 32+ char string)
- *   5. Set GITHUB_CLIENT_ID in wrangler.toml [vars]
+ * Setup: see auth/README.md.
  */
 
-import {
-  OAuthProvider,
-  type AuthRequest,
-  type ResolveExternalTokenInput,
-  type ResolveExternalTokenResult,
-} from "@cloudflare/workers-oauth-provider";
-import { WorkerEntrypoint } from "cloudflare:workers";
-import { exchangeCode, fetchGitHubUser, githubAuthorizeUrl } from "./github";
-import type { ActorProps, Env } from "./types";
+import { createAuth, type Auth } from "./auth";
+import type { Actor, Env } from "./types";
 import {
   lookupMirrorGrant,
   OidcError,
   verifyGitHubOidcToken,
 } from "./oidc";
 
-const ALL_SCOPES = [
-  "repo:read",
-  "repo:write",
-  "issue:write",
-  "pr:merge",
-  "admin",
-] as const;
-
-const SESSION_COOKIE = "ripgit_session";
-const SESSION_MAX_AGE = 7 * 24 * 3600; // 7 days
+/** Scopes carried by a signed-in user or their API keys. */
+const USER_SCOPES = ["repo:read", "repo:write", "issue:write", "pr:merge"];
 
 type PageFormat = "html" | "markdown" | "text";
 
@@ -70,99 +46,21 @@ interface TextAction {
   effect?: string;
 }
 
-// ---------------------------------------------------------------------------
-// AdminHandler — WorkerEntrypoint for /admin/* routes (programmatic API).
-// ctx.props populated by OAuthProvider after token validation.
-// ---------------------------------------------------------------------------
+// One better-auth instance per isolate: env is stable for an isolate's life.
+const authInstances = new WeakMap<Env, Auth>();
 
-export class AdminHandler extends WorkerEntrypoint<Env> {
-  async fetch(request: Request): Promise<Response> {
-    const actor = this.ctx.props as ActorProps;
-    const url = new URL(request.url);
-
-    if (url.pathname === "/admin/agents") {
-      if (request.method === "POST") return this.createAgent(request, actor);
-      if (request.method === "GET") return this.listAgents(actor);
-      return new Response("Method Not Allowed", { status: 405 });
-    }
-
-    return new Response("Not Found", { status: 404 });
+function getAuth(env: Env): Auth {
+  let auth = authInstances.get(env);
+  if (!auth) {
+    auth = createAuth(env);
+    authInstances.set(env, auth);
   }
-
-  private async createAgent(
-    request: Request,
-    caller: ActorProps,
-  ): Promise<Response> {
-    if (!caller.scopes.includes("admin")) {
-      return Response.json({ error: "admin scope required" }, { status: 403 });
-    }
-    let body: { name?: unknown; scopes?: unknown };
-    try {
-      body = (await request.json()) as { name?: unknown; scopes?: unknown };
-    } catch {
-      return Response.json({ error: "invalid JSON body" }, { status: 400 });
-    }
-    const name =
-      typeof body.name === "string" && body.name.trim()
-        ? body.name.trim()
-        : null;
-    if (!name) {
-      return Response.json({ error: "name is required" }, { status: 400 });
-    }
-    const requested = Array.isArray(body.scopes)
-      ? (body.scopes as unknown[]).filter(
-          (s): s is string => typeof s === "string",
-        )
-      : [...ALL_SCOPES];
-    const grantedScopes = requested.filter(
-      (s) =>
-        ALL_SCOPES.includes(s as (typeof ALL_SCOPES)[number]) &&
-        caller.scopes.includes(s),
-    );
-    const { token, actor } = await createAgentToken(
-      this.env,
-      name,
-      caller,
-      grantedScopes,
-    );
-    return Response.json(
-      { token, actorId: actor.actorId, name, scopes: grantedScopes },
-      { status: 201 },
-    );
-  }
-
-  private async listAgents(caller: ActorProps): Promise<Response> {
-    if (!caller.scopes.includes("admin")) {
-      return Response.json({ error: "admin scope required" }, { status: 403 });
-    }
-    const agents = await listAgentTokens(this.env, caller.actorId);
-    return Response.json({ agents });
-  }
+  return auth;
 }
 
-// ---------------------------------------------------------------------------
-// OAuthProvider — default export.
-// ---------------------------------------------------------------------------
-
-export default new OAuthProvider<Env>({
-  apiRoute: "/admin/",
-  apiHandler: AdminHandler,
-  defaultHandler: { fetch: mainHandler },
-  authorizeEndpoint: "/oauth/authorize",
-  tokenEndpoint: "/oauth/token",
-  clientRegistrationEndpoint: "/oauth/register",
-  scopesSupported: [...ALL_SCOPES],
-  accessTokenTTL: 3600,
-  refreshTokenTTL: 30 * 86400,
-  resolveExternalToken: async ({
-    token,
-    env,
-  }: ResolveExternalTokenInput): Promise<ResolveExternalTokenResult | null> => {
-    const raw = await (env as Env).OAUTH_KV.get(`agent:${token}`);
-    if (!raw) return null;
-    return { props: JSON.parse(raw) as ActorProps };
-  },
-});
+export default {
+  fetch: mainHandler,
+} satisfies ExportedHandler<Env>;
 
 // ---------------------------------------------------------------------------
 // mainHandler — resolves actor first, routes, then forwards to ripgit
@@ -170,48 +68,51 @@ export default new OAuthProvider<Env>({
 
 async function mainHandler(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+  const auth = getAuth(env);
+
+  if (url.pathname.startsWith("/api/auth/")) return auth.handler(request);
+
   const pageFormat = preferredPageFormat(request);
 
   // Resolve identity up front — available to all routes below
-  const actor = await resolveActor(request, env);
+  const actor = await resolveActor(request, env, auth);
 
   // ── Auth + settings routes ────────────────────────────────────────────────
 
-  if (url.pathname === "/login") return handleLogin(request, env);
-  if (url.pathname === "/logout") return handleLogout(request);
-  if (url.pathname === "/oauth/authorize")
-    return handleAuthorize(request, env);
-  if (url.pathname === "/oauth/callback") return handleCallback(request, env);
+  if (url.pathname === "/login") return handleLogin(request, auth);
+  if (url.pathname === "/logout") return handleLogout(request, auth);
   if (url.pathname === "/oidc/github/exchange" && request.method === "POST") {
     return handleOidcExchange(request, env);
   }
 
   if (url.pathname === "/settings") {
-    if (!actor) {
+    if (!actor || actor.kind === "mirror") {
       if (pageFormat.format === "html") return redirect(`/login?next=/settings`);
       return renderSettingsAuthRequiredPage(pageFormat);
     }
-    return handleSettings(request, env, actor, undefined, pageFormat);
+    return handleSettings(request, auth, actor, undefined, pageFormat);
   }
   if (url.pathname === "/settings/tokens" && request.method === "POST") {
-    if (!actor) return redirect(`/login?next=/settings`);
-    return handleCreateToken(request, env, actor);
+    if (!actor || actor.kind !== "user") return redirect(`/login?next=/settings`);
+    return handleCreateToken(request, auth, actor);
   }
-  // /settings/tokens/:agentId/revoke
+  // /settings/tokens/:keyId/revoke
   const revokeMatch = url.pathname.match(
     /^\/settings\/tokens\/([^/]+)\/revoke$/,
   );
   if (revokeMatch && request.method === "POST") {
-    if (!actor) return redirect(`/login?next=/settings`);
-    // decodeURIComponent because url.pathname preserves %3A rather than
-    // normalising it to ':', so "agent%3Auuid" would not match the KV key.
-    return handleRevokeToken(env, actor, decodeURIComponent(revokeMatch[1]));
+    if (!actor || actor.kind !== "user") return redirect(`/login?next=/settings`);
+    return handleRevokeToken(
+      request,
+      auth,
+      decodeURIComponent(revokeMatch[1]),
+    );
   }
 
   if (url.pathname === "/" && request.method === "GET") {
     // Logged-in users go straight to their profile page
-    if (actor && pageFormat.format === "html") {
-      return redirect(`/${actor.actorName}/`);
+    if (actor?.login && actor.kind === "user" && pageFormat.format === "html") {
+      return redirect(`/${actor.login}/`);
     }
     return renderLandingPage(new URL(request.url).origin, actor, pageFormat);
   }
@@ -405,59 +306,72 @@ function renderAuthPageHtml(options: {
 </html>`;
 }
 
+
 // ---------------------------------------------------------------------------
-// Settings — browser UI for token management
+// Settings — browser UI for API key management
 // ---------------------------------------------------------------------------
+
+interface TokenRow {
+  agentId: string;
+  name: string;
+}
+
+async function listTokens(request: Request, auth: Auth): Promise<TokenRow[]> {
+  const result = await auth.api.listApiKeys({ headers: request.headers });
+  const keys = Array.isArray(result) ? result : result.apiKeys;
+  return keys.map((k) => ({ agentId: k.id, name: k.name ?? k.start ?? k.id }));
+}
 
 async function handleSettings(
   request: Request,
-  env: Env,
-  actor: ActorProps,
+  auth: Auth,
+  actor: Actor,
   newToken?: string,
   pageFormat = preferredPageFormat(request),
 ): Promise<Response> {
-  const tokens = await listAgentTokens(env, actor.actorId);
+  // API-key callers may view settings; listing needs the owner's session, so
+  // they see the page without the key list.
+  const tokens = actor.kind === "user" ? await listTokens(request, auth) : [];
   const origin = new URL(request.url).origin;
   if (pageFormat.format === "html") {
     return respondPage(
-      renderSettingsPageHtml(actor.actorName, tokens, origin, newToken),
+      renderSettingsPageHtml(actor.login, tokens, origin, newToken),
       pageFormat,
     );
   }
   return respondPage(
-    renderSettingsPageText(actor.actorName, tokens, origin, newToken, pageFormat),
+    renderSettingsPageText(actor.login, tokens, origin, newToken, pageFormat),
     pageFormat,
   );
 }
 
 async function handleCreateToken(
   request: Request,
-  env: Env,
-  actor: ActorProps,
+  auth: Auth,
+  actor: Actor,
 ): Promise<Response> {
   const form = await request.formData();
   const name = ((form.get("name") as string) ?? "").trim();
   if (!name) return redirect("/settings");
 
-  const { token } = await createAgentToken(env, name, actor, [...ALL_SCOPES]);
+  const created = await auth.api.createApiKey({
+    body: { name },
+    headers: request.headers,
+  });
 
-  // Re-render settings page with the new token shown once
-  return handleSettings(request, env, actor, token);
+  // Re-render settings page with the new key shown once
+  return handleSettings(request, auth, actor, created.key);
 }
 
 async function handleRevokeToken(
-  env: Env,
-  actor: ActorProps,
-  agentId: string,
+  request: Request,
+  auth: Auth,
+  keyId: string,
 ): Promise<Response> {
-  const indexKey = `agent-index:${actor.actorId}:${agentId}`;
-  const token = await env.OAUTH_KV.get(indexKey);
-  if (token) {
-    await Promise.all([
-      env.OAUTH_KV.delete(`agent:${token}`),
-      env.OAUTH_KV.delete(indexKey),
-    ]);
-  }
+  // better-auth only deletes keys owned by the session's user.
+  await auth.api
+    .deleteApiKey({ body: { keyId }, headers: request.headers })
+    .catch(() => undefined);
   return redirect("/settings");
 }
 
@@ -478,7 +392,7 @@ ${renderTextActions([
     {
       method: "GET",
       path: "/login?next=/settings",
-      description: "start GitHub OAuth sign-in in a browser",
+      description: "start GitHub sign-in in a browser",
     },
     {
       method: "GET",
@@ -694,7 +608,7 @@ function renderIndentedBlock(text: string): string {
 
 function renderLandingPage(
   origin: string,
-  actor: ActorProps | null,
+  actor: Actor | null,
   pageFormat: PageFormatSelection,
 ): Response {
   if (pageFormat.format === "html") {
@@ -738,7 +652,7 @@ function renderLandingPageHtml(): string {
 
 function renderLandingPageText(
   origin: string,
-  actor: ActorProps | null,
+  actor: Actor | null,
   pageFormat: PageFormatSelection,
 ): string {
   const host = origin.replace(/^https?:\/\//, "");
@@ -746,11 +660,11 @@ function renderLandingPageText(
   if (actor) {
     let body = `# ripgit auth worker
 
-Signed in as: \`${actor.actorName}\`
+Signed in as: \`${actor.login}\`
 This auth worker fronts the ripgit backend, manages your browser session, and can mint long-lived tokens from \`/settings\`.
 
 ## Related Paths (GET paths)
-- \`/${actor.actorName}/\`
+- \`/${actor.login}/\`
 - \`/settings\`
 - \`/logout?next=/\`
 `;
@@ -758,13 +672,13 @@ This auth worker fronts the ripgit backend, manages your browser session, and ca
     body += renderTextActions([
       {
         method: "GET",
-        path: `/${actor.actorName}/`,
+        path: `/${actor.login}/`,
         description: "open your ripgit profile and repositories",
       },
       {
         method: "GET",
         path: "/settings",
-        description: "manage long-lived access tokens",
+        description: "manage API keys",
       },
       {
         method: "GET",
@@ -774,8 +688,8 @@ This auth worker fronts the ripgit backend, manages your browser session, and ca
     ]);
     body += renderTextHints([
       textNavigationHint(pageFormat),
-      `HTML requests to \`/\` redirect signed-in users to \`/${actor.actorName}/\`; text mode stays here so agents can discover the next steps.`,
-      `Tokens created at \`/settings\` work with git remotes like \`https://${actor.actorName}:TOKEN@${host}/${actor.actorName}/REPO\`.`,
+      `HTML requests to \`/\` redirect signed-in users to \`/${actor.login}/\`; text mode stays here so agents can discover the next steps.`,
+      `Tokens created at \`/settings\` work with git remotes like \`https://${actor.login}:TOKEN@${host}/${actor.login}/REPO\`.`,
     ]);
     return body;
   }
@@ -793,25 +707,19 @@ Access model:
 - \`/\`
 - \`/login\`
 - \`/settings\`
-- \`/oauth/authorize\`
 `;
 
   body += renderTextActions([
     {
       method: "GET",
       path: "/login",
-      description: "start GitHub OAuth sign-in in a browser",
+      description: "start GitHub sign-in in a browser",
     },
     {
       method: "GET",
       path: "/settings",
       description: "open token management after sign-in",
       requires: "authenticated session",
-    },
-    {
-      method: "GET",
-      path: "/oauth/authorize",
-      description: "start the OAuth provider flow for programmatic clients",
     },
   ]);
   body += renderTextHints([
@@ -822,254 +730,87 @@ Access model:
   return body;
 }
 
+
 // ---------------------------------------------------------------------------
-// GitHub OAuth flows
+// Sign-in and sign-out
 // ---------------------------------------------------------------------------
 
-async function handleLogin(request: Request, env: Env): Promise<Response> {
+/** Only same-origin paths, so ?next= cannot bounce a user off-site. */
+function safeNext(request: Request): string {
   const next = new URL(request.url).searchParams.get("next") ?? "/";
-  const state = crypto.randomUUID();
-  await env.OAUTH_KV.put(
-    `state:${state}`,
-    JSON.stringify({ type: "login", next }),
-    { expirationTtl: 600 },
-  );
-  const callbackUrl = new URL("/oauth/callback", request.url).toString();
-  return Response.redirect(
-    githubAuthorizeUrl(env.GITHUB_CLIENT_ID, state, callbackUrl),
-    302,
-  );
+  return next.startsWith("/") && !next.startsWith("//") ? next : "/";
 }
 
-async function handleAuthorize(request: Request, env: Env): Promise<Response> {
-  const oauthReq = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-  const state = crypto.randomUUID();
-  await env.OAUTH_KV.put(
-    `state:${state}`,
-    JSON.stringify({ type: "oauth", oauthReq }),
-    { expirationTtl: 600 },
-  );
-  const callbackUrl = new URL("/oauth/callback", request.url).toString();
-  return Response.redirect(
-    githubAuthorizeUrl(env.GITHUB_CLIENT_ID, state, callbackUrl),
-    302,
-  );
+/** Redirect, carrying over any cookies better-auth set on `from`. */
+function redirectWithCookies(location: string, from: Response): Response {
+  const response = redirect(location);
+  for (const cookie of from.headers.getSetCookie()) {
+    response.headers.append("Set-Cookie", cookie);
+  }
+  return response;
 }
 
-async function handleCallback(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const code = url.searchParams.get("code");
-  const state = url.searchParams.get("state");
-
-  if (!code || !state) {
-    return new Response("Missing code or state", { status: 400 });
-  }
-
-  const stateRaw = await env.OAUTH_KV.get(`state:${state}`);
-  if (!stateRaw) {
-    return new Response("Invalid or expired state — please try again", {
-      status: 400,
-    });
-  }
-  await env.OAUTH_KV.delete(`state:${state}`);
-
-  type StateData =
-    | { type: "login"; next: string }
-    | { type: "oauth"; oauthReq: AuthRequest };
-
-  const stateData = JSON.parse(stateRaw) as StateData;
-  const callbackUrl = new URL("/oauth/callback", request.url).toString();
-
-  let githubToken: string;
-  try {
-    githubToken = await exchangeCode(code, env, callbackUrl);
-  } catch (err) {
-    return new Response(`GitHub auth failed: ${(err as Error).message}`, {
-      status: 400,
-    });
-  }
-
-  const user = await fetchGitHubUser(githubToken);
-
-  if (stateData.type === "login") {
-    const actor: ActorProps = {
-      actorId: `github:${user.id}`,
-      actorName: user.login,
-      actorKind: "user",
-      scopes: [...ALL_SCOPES],
-    };
-    const sessionValue = await createSession(actor, env.SESSION_SECRET);
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: stateData.next,
-        "Set-Cookie": `${SESSION_COOKIE}=${encodeURIComponent(sessionValue)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE}`,
-      },
-    });
-  } else {
-    const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-      request: stateData.oauthReq,
-      userId: `github:${user.id}`,
-      metadata: { githubLogin: user.login },
-      scope: stateData.oauthReq.scope,
-      props: {
-        actorId: `github:${user.id}`,
-        actorName: user.login,
-        actorKind: "user",
-        scopes: stateData.oauthReq.scope,
-      } satisfies ActorProps,
-    });
-    return Response.redirect(redirectTo, 302);
-  }
-}
-
-function handleLogout(request: Request): Response {
-  const next = new URL(request.url).searchParams.get("next") ?? "/";
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: next,
-      "Set-Cookie": `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`,
-    },
+async function handleLogin(request: Request, auth: Auth): Promise<Response> {
+  const result = await auth.api.signInSocial({
+    body: { provider: "github", callbackURL: safeNext(request) },
+    headers: request.headers,
+    asResponse: true,
   });
+  const { url } = (await result.clone().json()) as { url?: string };
+  if (!url) return new Response("GitHub sign-in is unavailable", { status: 502 });
+  return redirectWithCookies(url, result);
 }
 
-// ---------------------------------------------------------------------------
-// KV helpers for agent tokens
-// ---------------------------------------------------------------------------
-
-async function createAgentToken(
-  env: Env,
-  name: string,
-  caller: ActorProps,
-  scopes: string[],
-): Promise<{ token: string; actor: ActorProps }> {
-  const token = generateToken();
-  const agentId = `agent:${crypto.randomUUID()}`;
-  const actor: ActorProps = {
-    actorId: agentId,
-    actorName: name,
-    actorKind: "agent",
-    ownerActorId: caller.actorId,
-    ownerActorName: caller.actorName, // caller's GitHub username — used for repo ownership checks
-    scopes,
-  };
-  await env.OAUTH_KV.put(`agent:${token}`, JSON.stringify(actor));
-  await env.OAUTH_KV.put(`agent-index:${caller.actorId}:${agentId}`, token);
-  return { token, actor };
-}
-
-async function listAgentTokens(
-  env: Env,
-  actorId: string,
-): Promise<{ agentId: string; name: string }[]> {
-  const prefix = `agent-index:${actorId}:`;
-  const list = await env.OAUTH_KV.list({ prefix });
-  const results = await Promise.all(
-    list.keys.map(async (k) => {
-      const agentId = k.name.slice(prefix.length);
-      const token = await env.OAUTH_KV.get(k.name);
-      if (!token) return null;
-      const raw = await env.OAUTH_KV.get(`agent:${token}`);
-      if (!raw) return null;
-      const a = JSON.parse(raw) as ActorProps;
-      return { agentId, name: a.actorName };
-    }),
-  );
-  return results.filter((r): r is { agentId: string; name: string } => r !== null);
-}
-
-// ---------------------------------------------------------------------------
-// Session cookie helpers — HMAC-SHA256 signed, stateless
-// ---------------------------------------------------------------------------
-
-async function createSession(
-  actor: ActorProps,
-  secret: string,
-): Promise<string> {
-  const payload = btoa(JSON.stringify(actor));
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(payload),
-  );
-  const sigHex = Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  return `${payload}.${sigHex}`;
-}
-
-async function verifySession(
-  value: string,
-  secret: string,
-): Promise<ActorProps | null> {
-  const dot = value.lastIndexOf(".");
-  if (dot < 0) return null;
-  const payload = value.slice(0, dot);
-  const sigHex = value.slice(dot + 1);
-  let sigBytes: Uint8Array;
-  try {
-    const pairs = sigHex.match(/.{2}/g) ?? [];
-    sigBytes = Uint8Array.from(pairs.map((h) => parseInt(h, 16)));
-  } catch {
-    return null;
-  }
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"],
-  );
-  const valid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    sigBytes,
-    new TextEncoder().encode(payload),
-  );
-  if (!valid) return null;
-  try {
-    return JSON.parse(atob(payload)) as ActorProps;
-  } catch {
-    return null;
-  }
-}
-
-function getSessionCookie(request: Request): string | null {
-  const cookies = request.headers.get("Cookie") ?? "";
-  const match = cookies.match(/(?:^|;\s*)ripgit_session=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : null;
+async function handleLogout(request: Request, auth: Auth): Promise<Response> {
+  const result = await auth.api.signOut({
+    headers: request.headers,
+    asResponse: true,
+  });
+  return redirectWithCookies(safeNext(request), result);
 }
 
 // ---------------------------------------------------------------------------
 // Identity resolution — returns null for anonymous, never blocks
 // ---------------------------------------------------------------------------
 
+async function loadLogin(env: Env, userId: string): Promise<string | null> {
+  const row = await env.AUTH_DB.prepare('SELECT login FROM "user" WHERE id = ?')
+    .bind(userId)
+    .first<{ login: string | null }>();
+  return row?.login ?? null;
+}
+
 async function resolveActor(
   request: Request,
   env: Env,
-): Promise<ActorProps | null> {
+  auth: Auth,
+): Promise<Actor | null> {
   const token = extractToken(request);
   if (token) {
-    const agentRaw = await env.OAUTH_KV.get(`agent:${token}`);
-    if (agentRaw) return JSON.parse(agentRaw) as ActorProps;
-    const tokenData = await env.OAUTH_PROVIDER.unwrapToken<ActorProps>(token);
-    if (tokenData && tokenData.expiresAt > Math.floor(Date.now() / 1000)) {
-      return tokenData.grant.props;
-    }
+    const mirror = await env.OAUTH_KV.get(`mirror-token:${token}`);
+    if (mirror) return JSON.parse(mirror) as Actor;
+
+    const { valid, key } = await auth.api.verifyApiKey({ body: { key: token } });
+    if (!valid || !key) return null;
+    const login = await loadLogin(env, key.referenceId);
+    if (login === null) return null;
+    return {
+      userId: key.referenceId,
+      login,
+      kind: "agent",
+      keyName: key.name ?? undefined,
+      scopes: USER_SCOPES,
+    };
   }
-  const cookieValue = getSessionCookie(request);
-  if (cookieValue) {
-    return verifySession(cookieValue, env.SESSION_SECRET);
-  }
-  return null;
+
+  const session = await auth.api.getSession({ headers: request.headers });
+  if (!session) return null;
+  return {
+    userId: session.user.id,
+    login: session.user.login ?? "",
+    kind: "user",
+    scopes: USER_SCOPES,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,13 +888,13 @@ async function handleOidcExchange(
 
     const [targetOwner] = grant.target.split("/");
     const token = generateToken();
-    const actor: ActorProps = {
-      actorId: `agent:gha:${claims.repository}`,
-      actorName: `github-actions:${claims.repository}`,
-      actorKind: "agent",
-      // Ownership in ripgit is checked against the *target* owner, which is the
-      // allowlist's decision — not against the GitHub owner in the token.
-      ownerActorName: targetOwner,
+    const actor: Actor = {
+      // Not a person: ripgit authorizes a mirror agent by its repo scope alone,
+      // on exactly the repository the allowlist chose.
+      userId: "",
+      login: targetOwner,
+      kind: "mirror",
+      keyName: `github-actions:${claims.repository}`,
       // `mirror` distinguishes this from a human token: a mirrored repo
       // refuses direct pushes, but the mirror agent's own push is the
       // mechanism that delivers commits.
@@ -1163,7 +904,7 @@ async function handleOidcExchange(
       // and an absent claim both fail closed rather than publishing a mirror.
       repoVisibility: claims.repository_visibility === "public" ? "public" : "private",
     };
-    await env.OAUTH_KV.put(`agent:${token}`, JSON.stringify(actor), {
+    await env.OAUTH_KV.put(`mirror-token:${token}`, JSON.stringify(actor), {
       expirationTtl: MIRROR_TOKEN_TTL,
     });
 
@@ -1197,7 +938,7 @@ function oidcError(
  */
 function denyOutOfScope(
   request: Request,
-  actor: ActorProps | null,
+  actor: Actor | null,
 ): Response | null {
   if (!actor?.repoScope) return null;
   const parts = new URL(request.url).pathname
@@ -1218,13 +959,14 @@ function denyOutOfScope(
   return null;
 }
 
+
 // ---------------------------------------------------------------------------
 // Forward to ripgit
 // ---------------------------------------------------------------------------
 
 function forwardToRipgit(
   request: Request,
-  actor: ActorProps | null,
+  actor: Actor | null,
   env: Env,
 ): Promise<Response> {
   const outOfScope = denyOutOfScope(request, actor);
@@ -1232,8 +974,8 @@ function forwardToRipgit(
 
   const headers = new Headers(request.headers);
 
-  // Strip any actor headers the caller supplied before setting our own. ripgit
-  // treats these as proof of identity, so a forged X-Ripgit-Actor-Name would be
+  // Strip any ripgit headers the caller supplied before setting our own. ripgit
+  // treats these as proof of identity, so a forged X-Ripgit-Actor-Id would be
   // full write access to someone else's repos, and X-Ripgit-Actor-Scopes:mirror
   // would walk past the mirror divergence guard. Nothing from the public
   // internet may reach ripgit under these names.
@@ -1244,21 +986,15 @@ function forwardToRipgit(
   }
 
   if (actor) {
-    // For ownership checks in ripgit, what matters is the GitHub username of the
-    // person who owns the repos. For agents, that's ownerActorName, not actorName
-    // (actorName is the token's display name, e.g. "laptop").
-    const ownerName =
-      actor.actorKind === "agent" && actor.ownerActorName
-        ? actor.ownerActorName
-        : actor.actorName;
-
-    headers.set("X-Ripgit-Actor-Id", actor.actorId);
-    headers.set("X-Ripgit-Actor-Name", ownerName);        // GitHub username for ownership
-    headers.set("X-Ripgit-Actor-Display-Name", actor.actorName); // token name for audit/display
-    headers.set("X-Ripgit-Actor-Kind", actor.actorKind);
+    headers.set("X-Ripgit-Actor-Id", actor.userId);
+    headers.set("X-Ripgit-Actor-Name", actor.login);
+    headers.set("X-Ripgit-Actor-Kind", actor.kind);
     headers.set("X-Ripgit-Actor-Scopes", actor.scopes.join(","));
-    if (actor.ownerActorId) {
-      headers.set("X-Ripgit-Actor-Owner", actor.ownerActorId);
+    if (actor.keyName) {
+      headers.set("X-Ripgit-Actor-Display-Name", actor.keyName);
+    }
+    if (actor.repoScope) {
+      headers.set("X-Ripgit-Actor-Repo", actor.repoScope);
     }
     if (actor.repoVisibility) {
       headers.set("X-Ripgit-Repo-Visibility", actor.repoVisibility);

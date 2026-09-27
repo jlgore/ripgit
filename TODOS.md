@@ -53,7 +53,7 @@ src/
   issues_web/     — Issues/pulls list, detail, and form HTML + markdown
                     renderers
 
-examples/github-oauth/
+auth/
   src/index.ts    — GitHub OAuth front worker, browser sessions, agent tokens,
                     trusted header forwarding, text-mode landing/settings
   README.md       — Setup, deploy, bindings/secrets, and text-mode docs
@@ -226,11 +226,11 @@ All items below have been implemented and verified.
 
 ### Auth + docs
 
-33. **Auth worker text mode** — `examples/github-oauth` landing page and
+33. **Auth worker text mode** — `auth` landing page and
     `/settings` also negotiate markdown/plain views for curl/agents.
 
 34. **Docs refresh** — `README.md` documents text-mode navigation and curl
-    examples. `examples/github-oauth/README.md` covers setup, deploy,
+    examples. `auth/README.md` covers setup, deploy,
     bindings/secrets, and text-mode behavior.
 
 ### Testing + fetch negotiation

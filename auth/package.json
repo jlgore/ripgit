@@ -1,10 +1,10 @@
 {
-  "name": "ripgit-github-oauth",
+  "name": "ripgit-auth",
   "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "dev:full": "wrangler dev -c wrangler.toml -c ../../wrangler.toml",
+    "dev:full": "wrangler dev -c wrangler.toml -c ../wrangler.toml",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit"
   },

@@ -4,7 +4,7 @@ This file is for AI coding agents. It covers the architecture, key design decisi
 
 ## What this is
 
-A self-hosted git server running on Cloudflare Durable Objects. Each repository is one DO with a SQLite database. The Worker entry point routes `/:owner/:repo/*` to the right DO by name. An optional TypeScript auth worker in `examples/github-oauth/` sits in front via Service Binding.
+A self-hosted git server running on Cloudflare Durable Objects. Each repository is one DO with a SQLite database. The Worker entry point routes `/:owner/:repo/*` to the right DO by name. An optional TypeScript auth worker in `auth/` sits in front via Service Binding.
 
 ## Repository layout
 
@@ -30,7 +30,7 @@ src/
                 parse_form() URL-decode utility.
   issues_web.rs Server-rendered HTML pages for issues and PRs. Uses web::layout() and helpers.
 
-examples/github-oauth/
+auth/
   src/index.ts  Auth worker: GitHub OAuth flow, session cookies, agent tokens, forwards to
                 ripgit via Service Binding with X-Ripgit-Actor-* headers.
   src/types.ts  ActorProps, Env types.
@@ -183,7 +183,7 @@ Ok(resp)
 cargo build --target wasm32-unknown-unknown
 
 # Run both workers locally (auth on :8787, ripgit as service binding)
-cd examples/github-oauth && npm run dev:full
+cd auth && npm run dev:full
 
 # Run ripgit alone (no auth, all writes open)
 wrangler dev

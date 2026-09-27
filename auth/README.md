@@ -105,7 +105,7 @@ Create a GitHub OAuth App at <https://github.com/settings/applications/new>.
 From the repo root:
 
 ```bash
-cd examples/github-oauth
+cd auth
 npm install
 npm run dev:full
 ```
@@ -132,7 +132,7 @@ git push origin main
 
 ## Deployment
 
-Create the KV namespace and fill the IDs into `examples/github-oauth/wrangler.toml`:
+Create the KV namespace and fill the IDs into `auth/wrangler.toml`:
 
 ```bash
 wrangler kv namespace create OAUTH_KV
@@ -150,11 +150,11 @@ Deploy ripgit first, then the auth worker:
 
 ```bash
 wrangler deploy
-cd examples/github-oauth
+cd auth
 wrangler deploy
 ```
 
-Make sure the `[[services]]` binding in `examples/github-oauth/wrangler.toml` points at the deployed ripgit Worker name.
+Make sure the `[[services]]` binding in `auth/wrangler.toml` points at the deployed ripgit Worker name.
 
 After deployment, update the GitHub OAuth App callback URL to your deployed auth worker URL.
 

@@ -12,7 +12,7 @@ git push origin main
 ## Features
 
 - **Standard git remote** — `git push`, `git clone`, `git fetch` with any git client
-- **Auth via Service Binding** — sits behind an auth worker; public read, owner-only write. GitHub OAuth example in `examples/github-oauth/`
+- **Auth via Service Binding** — sits behind an auth worker; public read, owner-only write. GitHub OAuth example in `auth/`
 - **Agent-first UI** — browsable pages also negotiate `text/markdown` and `text/plain`, with explicit actions and curl-friendly paths
 - **Web UI** — file browser, commit history, diffs, code search, syntax highlighting, branch selector, markdown README, repo settings
 - **Full-text search** — FTS5 over file content and commit messages. Supports `@author:`, `@message:`, `@path:`, `@ext:`, `@content:` query prefixes
@@ -78,14 +78,14 @@ ripgit reads identity from trusted `X-Ripgit-Actor-*` headers, which are only se
 
 ### GitHub OAuth example
 
-`examples/github-oauth/` is a TypeScript Cloudflare Worker that authenticates with GitHub, issues session cookies for browsers and long-lived tokens for agents/scripts, and forwards requests to ripgit via Service Binding. Its landing page and `/settings` also support the same text-mode negotiation for curl-driven agents.
+`auth/` is a TypeScript Cloudflare Worker that authenticates with GitHub, issues session cookies for browsers and long-lived tokens for agents/scripts, and forwards requests to ripgit via Service Binding. Its landing page and `/settings` also support the same text-mode negotiation for curl-driven agents.
 
-See `examples/github-oauth/README.md` for a focused deploy/setup guide.
+See `auth/README.md` for a focused deploy/setup guide.
 
 **Local dev:**
 
 ```bash
-cd examples/github-oauth
+cd auth
 npm install
 npm run dev:full   # auth worker on :8787, ripgit as service binding
 ```
@@ -100,7 +100,7 @@ git push origin main
 **First-time setup:**
 
 1. Create a GitHub OAuth App — callback URL: `http://localhost:8787/oauth/callback`
-2. Set `GITHUB_CLIENT_ID` in `examples/github-oauth/wrangler.toml`
+2. Set `GITHUB_CLIENT_ID` in `auth/wrangler.toml`
 3. `wrangler secret put GITHUB_CLIENT_SECRET`
 4. `wrangler secret put SESSION_SECRET`
 5. `wrangler kv namespace create OAUTH_KV` → fill IDs into `wrangler.toml`
@@ -109,7 +109,7 @@ git push origin main
 
 ```bash
 wrangler deploy                          # ripgit worker
-cd examples/github-oauth && wrangler deploy   # auth worker
+cd auth && wrangler deploy   # auth worker
 ```
 
 Update the GitHub OAuth App's callback URL to your deployed auth worker URL.
@@ -140,7 +140,7 @@ Without the auth worker in front, all repos are publicly readable and writable b
 browser / git client / agent
   │
   ▼
-Auth Worker  (examples/github-oauth — optional, recommended)
+Auth Worker  (auth — optional, recommended)
   │  validates session/token, sets X-Ripgit-Actor-* headers
   │  Service Binding
   ▼

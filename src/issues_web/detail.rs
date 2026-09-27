@@ -1,3 +1,5 @@
+use crate::authz::Role;
+use crate::web::Viewer;
 use crate::{api, diff, issues, presentation, web};
 use worker::*;
 
@@ -19,7 +21,7 @@ pub fn page_issue_detail(
     owner: &str,
     repo_name: &str,
     number: i64,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let (default_branch, _) = web::resolve_default_branch(sql)?;
 
@@ -45,7 +47,7 @@ pub fn page_issue_detail(
     };
 
     let pr_diff_section = if is_pr {
-        render_pr_diff_section(sql, owner, repo_name, &issue, actor_name)?
+        render_pr_diff_section(sql, owner, repo_name, &issue, viewer)?
     } else {
         String::new()
     };
@@ -61,7 +63,7 @@ pub fn page_issue_detail(
         ));
     }
 
-    let comment_form = if actor_name.is_some() {
+    let comment_form = if viewer.name.is_some() {
         format!(
             r#"<div class="comment comment-form-wrap">
               <div class="comment-header-row">
@@ -75,12 +77,12 @@ pub fn page_issue_detail(
                 </div>
               </form>
             </div>"#,
-            actor = web::html_escape(actor_name.unwrap_or("")),
+            actor = web::html_escape(viewer.name.unwrap_or("")),
             owner = web::html_escape(owner),
             repo = web::html_escape(repo_name),
             kind_url = kind_url,
             num = number,
-            state_btn = render_state_button(&issue, owner, repo_name, kind_url, actor_name),
+            state_btn = render_state_button(&issue, owner, repo_name, kind_url, viewer),
         )
     } else {
         String::new()
@@ -148,7 +150,7 @@ pub fn page_issue_detail(
         owner,
         repo_name,
         &default_branch,
-        actor_name,
+        viewer,
         &content,
     ))
 }
@@ -158,7 +160,7 @@ pub fn page_issue_detail_markdown(
     owner: &str,
     repo_name: &str,
     number: i64,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     selection: &presentation::NegotiatedRepresentation,
 ) -> Result<Response> {
     let issue = match issues::get_issue(sql, number)? {
@@ -168,7 +170,7 @@ pub fn page_issue_detail_markdown(
 
     let comments = issues::list_comments(sql, issue.id)?;
     let markdown = render_issue_detail_markdown(
-        sql, owner, repo_name, &issue, &comments, actor_name, selection,
+        sql, owner, repo_name, &issue, &comments, viewer, selection,
     )?;
     presentation::markdown_response(&markdown, selection)
 }
@@ -179,7 +181,7 @@ fn render_issue_detail_markdown(
     repo_name: &str,
     issue: &issues::IssueRow,
     comments: &[issues::CommentRow],
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     selection: &presentation::NegotiatedRepresentation,
 ) -> Result<String> {
     let is_pr = issue.kind == "pr";
@@ -203,7 +205,7 @@ fn render_issue_detail_markdown(
 
     if is_pr {
         markdown.push_str(&render_pr_markdown_section(
-            sql, owner, repo_name, issue, actor_name,
+            sql, owner, repo_name, issue, viewer,
         )?);
     }
 
@@ -322,16 +324,17 @@ fn render_state_button(
     owner: &str,
     repo_name: &str,
     kind_url: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> String {
-    let actor = match actor_name {
+    let actor = match viewer.name {
         Some(actor) => actor,
         None => return String::new(),
     };
     if issue.state == "merged" {
         return String::new();
     }
-    if actor != issue.author_name && actor != owner {
+    // Same rule as the close/reopen routes: the author, or triage and above.
+    if actor != issue.author_name && viewer.role < Role::Triage {
         return String::new();
     }
     if issue.state == "open" {
@@ -362,7 +365,7 @@ fn render_pr_diff_section(
     owner: &str,
     repo_name: &str,
     issue: &issues::IssueRow,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<String> {
     let target_branch = match &issue.target_branch {
         Some(branch) => branch.as_str(),
@@ -411,7 +414,7 @@ fn render_pr_diff_section(
         files_html.push_str(&crate::web::render_file_diff(file));
     }
 
-    let merge_section = if issue.state == "open" && actor_name == Some(owner) {
+    let merge_section = if issue.state == "open" && viewer.can_write() {
         format!(
             r#"<div class="pr-merge-box">
               <form method="POST"
@@ -461,7 +464,7 @@ fn render_pr_markdown_section(
     owner: &str,
     repo_name: &str,
     issue: &issues::IssueRow,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<String> {
     let mut markdown = String::from("\n## Pull Request\n");
 
@@ -484,7 +487,7 @@ fn render_pr_markdown_section(
 
     markdown.push_str(&format!(
         "- Merge status: {}\n",
-        render_merge_status_line(owner, repo_name, issue, actor_name)
+        render_merge_status_line(owner, repo_name, issue, viewer)
     ));
 
     markdown.push_str("\n## Changed Files\n");
@@ -529,7 +532,7 @@ fn render_merge_status_line(
     owner: &str,
     repo_name: &str,
     issue: &issues::IssueRow,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> String {
     if issue.state == "merged" {
         if let Some(merge_hash) = &issue.merge_commit_hash {
@@ -550,14 +553,14 @@ fn render_merge_status_line(
         .target_branch
         .as_deref()
         .unwrap_or("the target branch");
-    if actor_name == Some(owner) {
+    if viewer.can_write() {
         format!(
-            "open; repo owner can `POST {}` to create a merge commit on `{}`; conflicts return `409`",
+            "open; you can `POST {}` to create a merge commit on `{}`; conflicts return `409`",
             merge_path, target_branch
         )
     } else {
         format!(
-            "open; repo owner can merge with `POST {}` to create a merge commit on `{}`",
+            "open; someone with write access can merge with `POST {}` to create a merge commit on `{}`",
             merge_path, target_branch
         )
     }

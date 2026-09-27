@@ -252,3 +252,135 @@ describe("mirror agents", () => {
     expect(await pushesAs(source, mirrorAgentHeaders(`${owner}/repo`))).toBe(true);
   });
 });
+
+function form(fields) {
+  return {
+    "Content-Type": "application/x-www-form-urlencoded",
+    body: new URLSearchParams(fields).toString(),
+  };
+}
+
+async function postSettings(owner, repo, action, fields, headers) {
+  const { body, ...contentType } = form(fields);
+  const resp = await server.dispatch(`/${owner}/${repo}/settings/${action}`, {
+    method: "POST",
+    headers: { ...headers, ...contentType },
+    body,
+    redirect: "manual",
+  });
+  const text = await resp.text();
+  return { status: resp.status, text };
+}
+
+describe("internal visibility", () => {
+  test("org members can read an internal repo; outsiders and anonymous cannot", async () => {
+    const org = newName("org");
+    const owner = newName("orgowner");
+    const member = newName("member");
+    await seedOrg(org, { [owner]: "owner", [member]: "member" }, "none");
+    await push(org, "inside", actorHeaders(owner));
+
+    const set = await postSettings(org, "inside", "visibility", { visibility: "internal" }, actorHeaders(owner));
+    expect(set.status).toBe(302);
+
+    const read = async (headers) => {
+      const resp = await server.dispatch(`/${org}/inside/refs`, { headers });
+      await resp.arrayBuffer();
+      return resp.status;
+    };
+    // default_repo_role is "none", so this is visibility alone at work.
+    expect(await read(actorHeaders(member))).toBe(200);
+    expect(await read(actorHeaders(newName("outsider")))).toBe(404);
+    expect(await read({})).toBe(404);
+
+    const listing = async (headers) =>
+      (await server.dispatch(`/${org}/`, { headers: { ...headers, Accept: "text/markdown" } })).text();
+    expect(await listing(actorHeaders(member))).toContain("inside");
+    expect(await listing(actorHeaders(newName("outsider")))).not.toContain("inside");
+  });
+
+  test("a user namespace cannot choose internal", async () => {
+    const owner = newName("owner");
+    await push(owner, "repo", actorHeaders(owner));
+    const set = await postSettings(owner, "repo", "visibility", { visibility: "internal" }, actorHeaders(owner));
+    expect(set.status).toBe(400);
+  });
+
+  test("unknown visibility values are refused, not coerced", async () => {
+    const owner = newName("owner");
+    await push(owner, "repo", actorHeaders(owner));
+    const set = await postSettings(owner, "repo", "visibility", { visibility: "secret" }, actorHeaders(owner));
+    expect(set.status).toBe(400);
+  });
+});
+
+describe("repo settings: grants", () => {
+  test("an admin grants and revokes a user's role by login", async () => {
+    const owner = newName("owner");
+    const helper = newName("helper");
+    await seedUser(helper);
+    const source = await push(owner, "repo", actorHeaders(owner));
+
+    const granted = await postSettings(
+      owner, "repo", "grant",
+      { kind: "user", grantee: helper, role: "write" },
+      actorHeaders(owner),
+    );
+    expect(granted.status).toBe(302);
+    expect(await pushesAs(source, actorHeaders(helper))).toBe(true);
+
+    const page = await server.dispatch(`/${owner}/repo/settings`, {
+      headers: actorHeaders(owner, { Accept: "text/markdown" }),
+    });
+    expect(await page.text()).toContain(`\`${helper}\``);
+
+    const revoked = await postSettings(
+      owner, "repo", "revoke",
+      { kind: "user", id: userId(helper) },
+      actorHeaders(owner),
+    );
+    expect(revoked.status).toBe(302);
+    expect(await pushesAs(source, actorHeaders(helper))).toBe(false);
+  });
+
+  test("granting to someone who has never signed in is a 400", async () => {
+    const owner = newName("owner");
+    await push(owner, "repo", actorHeaders(owner));
+    const resp = await postSettings(
+      owner, "repo", "grant",
+      { kind: "user", grantee: newName("ghost"), role: "read" },
+      actorHeaders(owner),
+    );
+    expect(resp.status).toBe(400);
+    expect(resp.text).toContain("has signed in");
+  });
+
+  test("only admins may change grants", async () => {
+    const owner = newName("owner");
+    const writer = newName("writer");
+    await push(owner, "repo", actorHeaders(owner));
+    await grant(`${owner}/repo`, "user", userId(writer), "write");
+    const resp = await postSettings(
+      owner, "repo", "grant",
+      { kind: "user", grantee: writer, role: "admin" },
+      actorHeaders(writer),
+    );
+    expect(resp.status).toBe(403);
+  });
+});
+
+describe("role-aware pages", () => {
+  test("org admins see the Settings tab on org repos; members do not", async () => {
+    const org = newName("org");
+    const admin = newName("orgadmin");
+    const member = newName("member");
+    await seedOrg(org, { [admin]: "admin", [member]: "member" }, "read");
+    await push(org, "repo", actorHeaders(admin));
+
+    const settingsLink = `/${org}/repo/settings`;
+    const page = async (who) =>
+      (await server.dispatch(`/${org}/repo/`, { headers: actorHeaders(who, { Accept: "text/html" }) })).text();
+    expect(await page(admin)).toContain(settingsLink);
+    expect(await page(member)).not.toContain(settingsLink);
+  });
+});

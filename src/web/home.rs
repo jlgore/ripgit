@@ -102,7 +102,7 @@ fn build_home_page(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<HomePage> {
     let (ref_name, head_hash) = if let Some(reference) = api::get_query(url, "ref") {
         let hash = api::resolve_ref(sql, &reference)?;
@@ -140,7 +140,7 @@ fn build_home_page(
         repo_name: repo_name.to_string(),
         ref_name,
         branches: load_branches(sql)?,
-        viewer_is_owner: actor_name == Some(owner),
+        viewer_is_owner: viewer.can_write(),
         scheme: url.scheme().to_string(),
         host: url.host_str().unwrap_or("your-worker.dev").to_string(),
         state,
@@ -177,7 +177,7 @@ fn render_home_branch_selector(page: &HomePage) -> String {
     html
 }
 
-fn render_home_html(page: &HomePage, actor_name: Option<&str>, sql: &SqlStorage) -> String {
+fn render_home_html(page: &HomePage, viewer: Viewer<'_>, sql: &SqlStorage) -> String {
     let content = match &page.state {
         HomePageState::Populated {
             commit_hash,
@@ -250,7 +250,7 @@ git push origin main</pre>
         &page.owner,
         &page.repo_name,
         &page.ref_name,
-        actor_name,
+        viewer,
         &content,
     )
 }
@@ -463,10 +463,10 @@ pub fn page_home(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
-    let page = build_home_page(sql, owner, repo_name, url, actor_name)?;
-    html_response(&render_home_html(&page, actor_name, sql))
+    let page = build_home_page(sql, owner, repo_name, url, viewer)?;
+    html_response(&render_home_html(&page, viewer, sql))
 }
 
 pub fn page_home_markdown(
@@ -474,9 +474,9 @@ pub fn page_home_markdown(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
-    let page = build_home_page(sql, owner, repo_name, url, actor_name)?;
+    let page = build_home_page(sql, owner, repo_name, url, viewer)?;
     presentation::markdown_response(&render_home_markdown(&page, selection), selection)
 }

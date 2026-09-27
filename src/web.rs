@@ -5,7 +5,9 @@
 //! syntax highlighting in the file viewer.
 
 use crate::{
-    api, diff,
+    api,
+    authz::Role,
+    diff,
     presentation::{self, Action, Hint, NegotiatedRepresentation},
     store,
 };
@@ -33,16 +35,35 @@ type Url = worker::Url;
 // Layout: shared HTML shell
 // ---------------------------------------------------------------------------
 
+/// Who is looking at a page: their name, if signed in, and their role on the
+/// repo. Pages use the role to decide which controls to show; the routes
+/// behind those controls check it again.
+#[derive(Clone, Copy)]
+pub(crate) struct Viewer<'a> {
+    pub name: Option<&'a str>,
+    pub role: Role,
+}
+
+impl Viewer<'_> {
+    pub fn can_write(&self) -> bool {
+        self.role >= Role::Write
+    }
+
+    pub fn can_admin(&self) -> bool {
+        self.role >= Role::Admin
+    }
+}
+
 pub(crate) fn layout(
     title: &str,
     owner: &str,
     repo_name: &str,
     default_branch: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     content: &str,
 ) -> String {
-    let is_owner = actor_name == Some(owner);
-    let global_auth = match actor_name {
+    let is_owner = viewer.can_admin();
+    let global_auth = match viewer.name {
         Some(name) => format!(
             r#"<a href="/{n}" class="nav-user">{n}</a><a href="/logout" class="nav-signout">Sign out</a>"#,
             n = html_escape(name),
@@ -724,11 +745,11 @@ h2 { font-size: 16px; margin-bottom: 12px; }
 
 pub fn page_owner_profile(
     owner: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     url: &Url,
     repos: &[String],
 ) -> Result<Response> {
-    let is_owner = actor_name == Some(owner);
+    let is_owner = viewer.can_admin();
     let host = url.host_str().unwrap_or("your-worker.dev");
     let scheme = url.scheme();
 
@@ -857,12 +878,12 @@ git push origin main</pre>
 
 pub fn page_owner_profile_markdown(
     owner: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     url: &Url,
     repos: &[String],
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
-    let is_owner = actor_name == Some(owner);
+    let is_owner = viewer.can_admin();
     let host = url.host_str().unwrap_or("your-worker.dev");
     let scheme = url.scheme();
 

@@ -14,6 +14,40 @@ use worker::*;
 /// Header carrying the resolved role from the Worker to the DO.
 pub const ROLE_HEADER: &str = "X-Ripgit-Role";
 
+/// Header telling the DO whether the caller belongs to the org that owns the
+/// repo ("1" or "0"), which is what `internal` visibility turns on.
+pub const MEMBER_HEADER: &str = "X-Ripgit-Org-Member";
+
+/// What the Worker resolved for one request: the caller's role, and whether
+/// they are a member of the owning organization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Access {
+    pub role: Role,
+    pub org_member: bool,
+}
+
+impl Access {
+    pub const NONE: Access = Access {
+        role: Role::None,
+        org_member: false,
+    };
+
+    /// The access the Worker resolved for this request.
+    pub fn from_request(req: &Request) -> Access {
+        Access {
+            role: Role::from_request(req),
+            org_member: header(req, MEMBER_HEADER).as_deref() == Some("1"),
+        }
+    }
+
+    /// Stamp this access onto a request bound for the DO, replacing whatever
+    /// arrived under these names.
+    pub fn apply(&self, headers: &mut Headers) -> Result<()> {
+        headers.set(ROLE_HEADER, self.role.as_str())?;
+        headers.set(MEMBER_HEADER, if self.org_member { "1" } else { "0" })
+    }
+}
+
 /// A repo role. Ordered: each role includes everything below it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
@@ -134,14 +168,14 @@ WHERE n.name = ?3
 ///
 /// Fails closed: an unclaimed namespace, a missing DIRECTORY binding, or a
 /// query error all mean no role.
-pub async fn resolve_role(
+pub async fn resolve_access(
     env: &Env,
     actor: Option<&Actor>,
     owner: &str,
     repo: Option<&str>,
-) -> Role {
+) -> Access {
     let Some(actor) = actor else {
-        return Role::None;
+        return Access::NONE;
     };
     // "" matches no grant row, so a namespace-level query sees no repo grants.
     let path = repo
@@ -150,20 +184,24 @@ pub async fn resolve_role(
 
     // A mirror agent may write to exactly the repo its OIDC grant named.
     if actor.kind == "mirror" {
-        return match &actor.repo {
+        let role = match &actor.repo {
             Some(scope) if !path.is_empty() && scope.to_lowercase() == path => Role::Write,
             _ => Role::None,
         };
+        return Access {
+            role,
+            org_member: false,
+        };
     }
     if actor.id.is_empty() {
-        return Role::None;
+        return Access::NONE;
     }
 
     let db = match env.d1("DIRECTORY") {
         Ok(db) => db,
         Err(e) => {
             console_error!("authz: DIRECTORY binding unavailable: {}", e);
-            return Role::None;
+            return Access::NONE;
         }
     };
     let row = async {
@@ -179,13 +217,185 @@ pub async fn resolve_role(
     .await;
 
     match row {
-        Ok(Some(row)) => role_from_row(&row, &actor.id),
-        Ok(None) => Role::None,
+        Ok(Some(row)) => Access {
+            role: role_from_row(&row, &actor.id),
+            // Only an org namespace has members; a user's own namespace makes
+            // them admin, which already reads everything.
+            org_member: row.kind == "org" && row.org_role.is_some(),
+        },
+        Ok(None) => Access::NONE,
         Err(e) => {
             console_error!("authz: role query for {} failed: {}", path, e);
-            Role::None
+            Access::NONE
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Repo access management (the settings page). ripgit writes only its own
+// ripgit_repo_grants table; users, orgs, and teams belong to better-auth.
+// ---------------------------------------------------------------------------
+
+/// One grant on a repo, with a label a person can read.
+#[derive(Deserialize)]
+pub struct GrantView {
+    /// "user" | "team"
+    pub kind: String,
+    pub id: String,
+    pub role: String,
+    /// The user's login or the team's name.
+    pub label: String,
+}
+
+#[derive(Deserialize)]
+pub struct TeamView {
+    pub id: String,
+    pub name: String,
+}
+
+/// Everything the settings page shows about who can reach a repo.
+pub struct RepoAccessInfo {
+    /// Whether the owner namespace is an organization (internal visibility and
+    /// team grants only make sense there).
+    pub is_org: bool,
+    pub grants: Vec<GrantView>,
+    /// The owning org's teams, to grant from.
+    pub teams: Vec<TeamView>,
+}
+
+fn directory(env: &Env) -> Result<D1Database> {
+    env.d1("DIRECTORY")
+}
+
+fn repo_key(owner: &str, repo: &str) -> String {
+    format!("{}/{}", owner, repo).to_lowercase()
+}
+
+pub async fn load_repo_access(env: &Env, owner: &str, repo: &str) -> Result<RepoAccessInfo> {
+    #[derive(Deserialize)]
+    struct KindRow {
+        kind: String,
+    }
+    let db = directory(env)?;
+    let owner = owner.to_lowercase();
+
+    let is_org = db
+        .prepare("SELECT kind FROM ripgit_namespaces WHERE name = ?1")
+        .bind(&[owner.clone().into()])?
+        .first::<KindRow>(None)
+        .await?
+        .is_some_and(|row| row.kind == "org");
+
+    let grants = db
+        .prepare(
+            r#"SELECT g.grantee_kind AS kind, g.grantee_id AS id, g.role,
+                      COALESCE(u.login, t.name, g.grantee_id) AS label
+               FROM ripgit_repo_grants g
+               LEFT JOIN "user" u ON g.grantee_kind = 'user' AND u.id = g.grantee_id
+               LEFT JOIN team t ON g.grantee_kind = 'team' AND t.id = g.grantee_id
+               WHERE g.repo = ?1
+               ORDER BY g.grantee_kind, label"#,
+        )
+        .bind(&[repo_key(&owner, repo).into()])?
+        .all()
+        .await?
+        .results::<GrantView>()?;
+
+    let teams = if is_org {
+        db.prepare(
+            r#"SELECT t.id, t.name FROM team t
+               JOIN ripgit_namespaces n ON n.org_id = t."organizationId"
+               WHERE n.name = ?1
+               ORDER BY t.name"#,
+        )
+        .bind(&[owner.into()])?
+        .all()
+        .await?
+        .results::<TeamView>()?
+    } else {
+        Vec::new()
+    };
+
+    Ok(RepoAccessInfo {
+        is_org,
+        grants,
+        teams,
+    })
+}
+
+/// Grant `role` on `owner/repo` to a user (by login) or a team (by id, which
+/// must belong to the owning org). Replaces any existing grant to the same
+/// grantee. The outer error is infrastructure; the inner one is a message for
+/// the person who submitted the form.
+pub async fn grant(
+    env: &Env,
+    owner: &str,
+    repo: &str,
+    kind: &str,
+    grantee: &str,
+    role: &str,
+) -> Result<std::result::Result<(), String>> {
+    #[derive(Deserialize)]
+    struct IdRow {
+        id: String,
+    }
+    let role = Role::parse(role);
+    if role == Role::None {
+        return Ok(Err("role must be read, triage, write, or admin".into()));
+    }
+    let db = directory(env)?;
+    let grantee = grantee.trim();
+
+    let id = match kind {
+        "user" => db
+            .prepare(r#"SELECT id FROM "user" WHERE login = ?1"#)
+            .bind(&[grantee.to_lowercase().into()])?
+            .first::<IdRow>(None)
+            .await?
+            .map(|row| row.id)
+            .ok_or_else(|| format!("no user with login `{}` has signed in", grantee)),
+        "team" => db
+            .prepare(
+                r#"SELECT t.id FROM team t
+                   JOIN ripgit_namespaces n ON n.org_id = t."organizationId"
+                   WHERE n.name = ?1 AND t.id = ?2"#,
+            )
+            .bind(&[owner.to_lowercase().into(), grantee.into()])?
+            .first::<IdRow>(None)
+            .await?
+            .map(|row| row.id)
+            .ok_or_else(|| "that team does not belong to this organization".to_string()),
+        _ => Err("grantee kind must be user or team".to_string()),
+    };
+    let id = match id {
+        Ok(id) => id,
+        Err(message) => return Ok(Err(message)),
+    };
+
+    db.prepare(
+        "INSERT INTO ripgit_repo_grants (repo, grantee_kind, grantee_id, role) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (repo, grantee_kind, grantee_id) DO UPDATE SET role = excluded.role",
+    )
+    .bind(&[
+        repo_key(owner, repo).into(),
+        kind.into(),
+        id.into(),
+        role.as_str().into(),
+    ])?
+    .run()
+    .await?;
+    Ok(Ok(()))
+}
+
+pub async fn revoke(env: &Env, owner: &str, repo: &str, kind: &str, id: &str) -> Result<()> {
+    directory(env)?
+        .prepare(
+            "DELETE FROM ripgit_repo_grants WHERE repo = ?1 AND grantee_kind = ?2 AND grantee_id = ?3",
+        )
+        .bind(&[repo_key(owner, repo).into(), kind.into(), id.into()])?
+        .run()
+        .await?;
+    Ok(())
 }
 
 /// The highest role any of a comma-separated list grants.

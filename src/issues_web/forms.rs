@@ -1,3 +1,4 @@
+use crate::web::Viewer;
 use crate::{api, presentation, web};
 use worker::*;
 
@@ -73,7 +74,7 @@ pub fn page_new_issue(
     sql: &SqlStorage,
     owner: &str,
     repo_name: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let page = IssueFormPage::new(sql, owner, repo_name)?;
 
@@ -104,7 +105,7 @@ pub fn page_new_issue(
         &page.owner,
         &page.repo_name,
         &page.default_branch,
-        actor_name,
+        viewer,
         &content,
     ))
 }
@@ -113,7 +114,7 @@ pub fn page_new_issue_markdown(
     sql: &SqlStorage,
     owner: &str,
     repo_name: &str,
-    _actor_name: Option<&str>,
+    _viewer: Viewer<'_>,
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
     let page = IssueFormPage::new(sql, owner, repo_name)?;
@@ -125,7 +126,7 @@ pub fn page_new_pull(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let page = PullFormPage::new(sql, owner, repo_name, url)?;
 
@@ -136,7 +137,7 @@ pub fn page_new_pull(
             &page.owner,
             &page.repo_name,
             &page.default_branch,
-            actor_name,
+            viewer,
             content,
         ));
     }
@@ -215,7 +216,7 @@ pub fn page_new_pull(
         &page.owner,
         &page.repo_name,
         &page.default_branch,
-        actor_name,
+        viewer,
         &content,
     ))
 }
@@ -225,7 +226,7 @@ pub fn page_new_pull_markdown(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    _actor_name: Option<&str>,
+    _viewer: Viewer<'_>,
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
     let page = PullFormPage::new(sql, owner, repo_name, url)?;

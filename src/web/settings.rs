@@ -1,15 +1,21 @@
 use super::*;
+use crate::authz::RepoAccessInfo;
 
-struct SettingsPage {
+struct SettingsPage<'a> {
     owner: String,
     repo_name: String,
     commits: i64,
     blobs: i64,
     db_bytes: u64,
     default_branch: String,
+    /// "public" | "internal" | "private"
+    visibility: &'a str,
+    access: &'a RepoAccessInfo,
 }
 
-impl SettingsPage {
+const ROLES: [&str; 4] = ["read", "triage", "write", "admin"];
+
+impl SettingsPage<'_> {
     fn settings_path(&self) -> String {
         format!("/{}/{}/settings", self.owner, self.repo_name)
     }
@@ -23,7 +29,13 @@ impl SettingsPage {
     }
 }
 
-fn build_settings_page(sql: &SqlStorage, owner: &str, repo_name: &str) -> Result<SettingsPage> {
+fn build_settings_page<'a>(
+    sql: &SqlStorage,
+    owner: &str,
+    repo_name: &str,
+    visibility: &'a str,
+    access: &'a RepoAccessInfo,
+) -> Result<SettingsPage<'a>> {
     #[derive(serde::Deserialize)]
     struct CountRow {
         n: i64,
@@ -50,10 +62,12 @@ fn build_settings_page(sql: &SqlStorage, owner: &str, repo_name: &str) -> Result
         db_bytes: sql.database_size() as u64,
         default_branch: store::get_config(sql, "default_branch")?
             .unwrap_or_else(|| "refs/heads/main".to_string()),
+        visibility,
+        access,
     })
 }
 
-fn render_settings_html(page: &SettingsPage, actor_name: Option<&str>) -> String {
+fn render_settings_html(page: &SettingsPage, viewer: Viewer<'_>) -> String {
     let mut html = String::new();
     html.push_str(&format!(
         r#"
@@ -95,6 +109,8 @@ fn render_settings_html(page: &SettingsPage, actor_name: Option<&str>) -> String
         fts_head = page.action_path("rebuild-fts"),
     ));
 
+    html.push_str(&render_access_html(page));
+
     html.push_str(&format!(
         r#"
 <section class="settings-section">
@@ -128,14 +144,116 @@ fn render_settings_html(page: &SettingsPage, actor_name: Option<&str>) -> String
         &page.owner,
         &page.repo_name,
         &page.default_branch,
-        actor_name,
+        viewer,
         &html,
+    )
+}
+
+fn visibility_options(page: &SettingsPage) -> Vec<(&'static str, &'static str)> {
+    let mut options = vec![("public", "Public — anyone can read")];
+    if page.access.is_org {
+        options.push(("internal", "Internal — members of the organization can read"));
+    }
+    options.push(("private", "Private — only people and teams granted access"));
+    options
+}
+
+fn role_select(name: &str) -> String {
+    let options: String = ROLES
+        .iter()
+        .map(|r| format!(r#"<option value="{r}"{sel}>{r}</option>"#, sel = if *r == "read" { " selected" } else { "" }))
+        .collect();
+    format!(r#"<select name="{name}" class="branch-input">{options}</select>"#)
+}
+
+fn render_access_html(page: &SettingsPage) -> String {
+    let visibility_options: String = visibility_options(page)
+        .into_iter()
+        .map(|(value, label)| {
+            format!(
+                r#"<option value="{value}"{sel}>{label}</option>"#,
+                sel = if value == page.visibility { " selected" } else { "" },
+            )
+        })
+        .collect();
+
+    let grants = if page.access.grants.is_empty() {
+        r#"<p class="settings-hint">No one has been granted access individually.</p>"#.to_string()
+    } else {
+        let rows: String = page
+            .access
+            .grants
+            .iter()
+            .map(|g| {
+                format!(
+                    r#"<tr><td>{kind}</td><td>{label}</td><td>{role}</td><td>
+  <form method="POST" action="{action}" class="inline-form">
+    <input type="hidden" name="kind" value="{kind}">
+    <input type="hidden" name="id" value="{id}">
+    <button class="btn-action" type="submit">Remove</button>
+  </form></td></tr>"#,
+                    kind = html_escape(&g.kind),
+                    label = html_escape(&g.label),
+                    role = html_escape(&g.role),
+                    id = html_escape(&g.id),
+                    action = page.action_path("revoke"),
+                )
+            })
+            .collect();
+        format!(r#"<table class="grants"><thead><tr><th>Kind</th><th>Who</th><th>Role</th><th></th></tr></thead><tbody>{rows}</tbody></table>"#)
+    };
+
+    let team_form = if page.access.is_org && !page.access.teams.is_empty() {
+        let teams: String = page
+            .access
+            .teams
+            .iter()
+            .map(|t| format!(r#"<option value="{}">{}</option>"#, html_escape(&t.id), html_escape(&t.name)))
+            .collect();
+        format!(
+            r#"
+  <form method="POST" action="{action}" class="inline-form">
+    <input type="hidden" name="kind" value="team">
+    <select name="grantee" class="branch-input">{teams}</select>
+    {roles}
+    <button class="btn-action" type="submit">Grant to team</button>
+  </form>"#,
+            action = page.action_path("grant"),
+            roles = role_select("role"),
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"
+<section class="settings-section">
+  <h2>Visibility</h2>
+  <form method="POST" action="{visibility_action}" class="inline-form">
+    <select name="visibility" class="branch-input">{visibility_options}</select>
+    <button class="btn-action" type="submit">Save</button>
+  </form>
+</section>
+<section class="settings-section">
+  <h2>Access</h2>
+  <p class="settings-hint">Roles: read &lt; triage (close issues) &lt; write (push, merge) &lt; admin (these settings).</p>
+  {grants}
+  <form method="POST" action="{grant_action}" class="inline-form">
+    <input type="hidden" name="kind" value="user">
+    <input type="text" name="grantee" placeholder="GitHub login" class="branch-input" required>
+    {roles}
+    <button class="btn-action" type="submit">Grant to user</button>
+  </form>{team_form}
+</section>"#,
+        visibility_action = page.action_path("visibility"),
+        grant_action = page.action_path("grant"),
+        roles = role_select("role"),
     )
 }
 
 fn render_settings_markdown(page: &SettingsPage, selection: &NegotiatedRepresentation) -> String {
     let mut markdown = format!(
-        "# {}/{} settings\n\nOwner-only repository maintenance page.\n\n## Repository Stats\n- Commits: `{}`\n- Blobs: `{}`\n- Database size: `{:.1} MB` (`{}` bytes)\n\n## Current Configuration\n- Settings page: `{}`\n- Default branch: `{}`\n- Code search rebuilds index the current default branch only.\n",
+        "# {}/{} settings\n\nAdmin-only repository maintenance page.\n\n## Repository Stats\n- Commits: `{}`\n- Blobs: `{}`\n- Database size: `{:.1} MB` (`{}` bytes)\n\n## Current Configuration\n- Settings page: `{}`\n- Default branch: `{}`\n- Code search rebuilds index the current default branch only.\n",
         page.owner,
         page.repo_name,
         page.commits,
@@ -146,30 +264,82 @@ fn render_settings_markdown(page: &SettingsPage, selection: &NegotiatedRepresent
         page.default_branch,
     );
 
-    let actions = vec![
+    markdown.push_str(&format!("\n## Access\n- Visibility: `{}`\n", page.visibility));
+    if page.access.grants.is_empty() {
+        markdown.push_str("- Grants: none\n");
+    } else {
+        for g in &page.access.grants {
+            markdown.push_str(&format!(
+                "- {} `{}` (id `{}`): `{}`\n",
+                g.kind, g.label, g.id, g.role
+            ));
+        }
+    }
+    for t in &page.access.teams {
+        markdown.push_str(&format!("- Team available to grant: `{}` (id `{}`)\n", t.name, t.id));
+    }
+
+    let visibility_values: Vec<&str> = visibility_options(page).into_iter().map(|(v, _)| v).collect();
+    let mut actions = vec![
+        Action::post(
+            page.action_path("visibility"),
+            "set who may read this repository without a grant",
+        )
+        .with_requires("repo admin")
+        .with_fields(vec![presentation::ActionField::required(
+            "visibility",
+            &format!("one of `{}`", visibility_values.join("`, `")),
+        )])
+        .with_effect("stores the visibility, updates the owner profile listing, then redirects back to settings"),
+        Action::post(
+            page.action_path("grant"),
+            "grant a user or team a role on this repository",
+        )
+        .with_requires("repo admin")
+        .with_fields(vec![
+            presentation::ActionField::required("kind", "`user` or `team`"),
+            presentation::ActionField::required(
+                "grantee",
+                "a user's GitHub login (they must have signed in once), or a team id from this page",
+            ),
+            presentation::ActionField::required("role", "`read`, `triage`, `write`, or `admin`"),
+        ])
+        .with_effect("adds the grant or replaces the grantee's existing role, then redirects back to settings; unknown users or teams return `400`"),
+        Action::post(
+            page.action_path("revoke"),
+            "remove a grant",
+        )
+        .with_requires("repo admin")
+        .with_fields(vec![
+            presentation::ActionField::required("kind", "`user` or `team`"),
+            presentation::ActionField::required("id", "the grantee id listed above"),
+        ])
+        .with_effect("deletes the grant, then redirects back to settings"),
+    ];
+    actions.extend(vec![
         Action::post(
             page.action_path("rebuild-graph"),
             "rebuild the commit ancestry graph used by history and log traversal",
         )
-        .with_requires("repo owner")
+        .with_requires("repo admin")
         .with_effect("deletes existing `commit_graph` rows, regenerates them from `commit_parents`, then redirects back to settings"),
         Action::post(
             page.action_path("rebuild-fts-commits"),
             "rebuild the commit search index over commit messages and authors",
         )
-        .with_requires("repo owner")
+        .with_requires("repo admin")
         .with_effect("clears `fts_commits`, re-inserts every commit, then redirects back to settings"),
         Action::post(
             page.action_path("rebuild-fts"),
             "rebuild the code search index for the saved default branch",
         )
-        .with_requires("repo owner")
+        .with_requires("repo admin")
         .with_effect("looks up the current `default_branch`, rebuilds the HEAD file-content index from that ref when it exists, then redirects back to settings"),
         Action::post(
             page.action_path("default-branch"),
             "save the repository default branch used by the UI and code-search rebuilds",
         )
-        .with_requires("repo owner")
+        .with_requires("repo admin")
         .with_fields(vec![presentation::ActionField::required(
             "branch",
             "full ref name to store, for example `refs/heads/main`; empty or whitespace-only input leaves the current value unchanged",
@@ -179,7 +349,7 @@ fn render_settings_markdown(page: &SettingsPage, selection: &NegotiatedRepresent
             page.action_path("delete"),
             "permanently delete this repository",
         )
-        .with_requires("repo owner")
+        .with_requires("repo admin")
         .with_fields(vec![presentation::ActionField::required(
             "confirm",
             &format!(
@@ -191,11 +361,11 @@ fn render_settings_markdown(page: &SettingsPage, selection: &NegotiatedRepresent
             "danger: on an exact match, deletes all Durable Object storage for `{}/{}` and redirects to `/{}/`; any other value leaves the repository intact and redirects back to settings",
             page.owner, page.repo_name, page.owner
         )),
-    ];
+    ]);
 
     let hints = vec![
         presentation::text_navigation_hint(*selection),
-        Hint::new("All settings mutations here are POST-only and owner-only."),
+        Hint::new("All settings mutations here are POST-only and require the admin role on this repository."),
         Hint::new("Use fully qualified refs like `refs/heads/main` for the default branch; this form does not verify that the ref exists before saving."),
         Hint::new("Danger: repository deletion is irreversible because it clears the repository Durable Object storage."),
     ];
@@ -209,18 +379,22 @@ pub fn page_settings(
     sql: &SqlStorage,
     owner: &str,
     repo_name: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
+    visibility: &str,
+    access: &RepoAccessInfo,
 ) -> Result<Response> {
-    let page = build_settings_page(sql, owner, repo_name)?;
-    html_response(&render_settings_html(&page, actor_name))
+    let page = build_settings_page(sql, owner, repo_name, visibility, access)?;
+    html_response(&render_settings_html(&page, viewer))
 }
 
 pub fn page_settings_markdown(
     sql: &SqlStorage,
     owner: &str,
     repo_name: &str,
+    visibility: &str,
+    access: &RepoAccessInfo,
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
-    let page = build_settings_page(sql, owner, repo_name)?;
+    let page = build_settings_page(sql, owner, repo_name, visibility, access)?;
     presentation::markdown_response(&render_settings_markdown(&page, selection), selection)
 }

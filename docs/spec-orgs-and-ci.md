@@ -33,7 +33,7 @@ a session cookie, agent token, or GitHub OIDC token into trusted
 records that the name is claimed or by whom. The REGISTRY KV holds
 `repo:{owner}/{repo}` → `"public" | "private"`.
 
-**workers-rs fork** (`jlgore/workers-rs` @ `afed3da`) adds Artifacts and
+**workers-rs fork** (`jlgore/workers-rs` @ `14cc828`, synced with upstream 2026-09-27) adds Artifacts and
 Workflows bindings and Rust `#[workflow]` entrypoints. Containers and D1 come
 from upstream. Neither feature below is expected to need fork changes; see
 [Fork checks](#fork-checks).

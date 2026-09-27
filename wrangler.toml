@@ -19,7 +19,7 @@ database_id = "REPLACE_WITH_D1_DATABASE_ID"
 binding = "REGISTRY"
 id = "b80650158bf14ea6852df7a0302f6e10"
 [build]
-command = "cargo install -q --git https://github.com/jlgore/workers-rs --rev afed3da worker-build && worker-build --release"
+command = "cargo install -q --git https://github.com/jlgore/workers-rs --rev 14cc828 worker-build && worker-build --release"
 
 [durable_objects]
 bindings = [

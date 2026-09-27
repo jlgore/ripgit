@@ -4,7 +4,7 @@
 # at the auth worker for a token that lives ten minutes and may write to exactly
 # one ripgit repo, and pushes. Nothing is stored in GitHub secrets.
 #
-# Enroll the owner once (see examples/github-oauth/README.md); every repo
+# Enroll the owner once (see auth/README.md); every repo
 # beneath it can then mirror itself by adding this file and nothing else:
 #   wrangler kv key put --binding OAUTH_KV "mirror-owner:<owner>" \
 #     '{"refs":["refs/heads/main"]}'

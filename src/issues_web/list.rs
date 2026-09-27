@@ -1,3 +1,4 @@
+use crate::web::Viewer;
 use crate::{api, issues, presentation, web};
 use worker::*;
 
@@ -138,10 +139,10 @@ pub fn page_issues_list(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let page = build_list_page(sql, owner, repo_name, url, "issue")?;
-    render_list_html(&page, actor_name)
+    render_list_html(&page, viewer)
 }
 
 pub fn page_pulls_list(
@@ -149,10 +150,10 @@ pub fn page_pulls_list(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let page = build_list_page(sql, owner, repo_name, url, "pr")?;
-    render_list_html(&page, actor_name)
+    render_list_html(&page, viewer)
 }
 
 pub fn page_issues_list_markdown(
@@ -160,12 +161,12 @@ pub fn page_issues_list_markdown(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
     let page = build_list_page(sql, owner, repo_name, url, "issue")?;
     presentation::markdown_response(
-        &render_list_markdown(&page, actor_name, selection),
+        &render_list_markdown(&page, viewer, selection),
         selection,
     )
 }
@@ -175,17 +176,17 @@ pub fn page_pulls_list_markdown(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
     let page = build_list_page(sql, owner, repo_name, url, "pr")?;
     presentation::markdown_response(
-        &render_list_markdown(&page, actor_name, selection),
+        &render_list_markdown(&page, viewer, selection),
         selection,
     )
 }
 
-fn render_list_html(page: &ListPage, actor_name: Option<&str>) -> Result<Response> {
+fn render_list_html(page: &ListPage, viewer: Viewer<'_>) -> Result<Response> {
     let is_open_tab = page.state == "open";
 
     let tabs = format!(
@@ -201,7 +202,7 @@ fn render_list_html(page: &ListPage, actor_name: Option<&str>) -> Result<Respons
         closed_count = page.closed_count,
     );
 
-    let new_btn = if actor_name.is_some() {
+    let new_btn = if viewer.name.is_some() {
         format!(
             r#"<a href="{}" class="btn-primary">{}</a>"#,
             web::html_escape(&page.new_path()),
@@ -297,14 +298,14 @@ fn render_list_html(page: &ListPage, actor_name: Option<&str>) -> Result<Respons
         &page.owner,
         &page.repo_name,
         &page.default_branch,
-        actor_name,
+        viewer,
         &content,
     ))
 }
 
 fn render_list_markdown(
     page: &ListPage,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     selection: &NegotiatedRepresentation,
 ) -> String {
     let mut markdown = format!(
@@ -382,7 +383,7 @@ fn render_list_markdown(
         Action::get(page.closed_path(), "view closed items"),
     ];
 
-    if actor_name.is_some() {
+    if viewer.name.is_some() {
         actions.push(Action::get(
             page.new_path(),
             format!("open the {} form", page.new_label),

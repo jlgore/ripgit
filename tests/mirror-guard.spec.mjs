@@ -16,7 +16,7 @@ import {
   appendLineAndCommit,
   pushAsOwner,
 } from "./helpers/git.mjs";
-import { actorHeaders, createTestServer, uniqueId } from "./helpers/mf.mjs";
+import { actorHeaders, createTestServer, uniqueId, mirrorAgentHeaders } from "./helpers/mf.mjs";
 
 let server;
 const tempDirs = [];
@@ -97,13 +97,11 @@ describe("mirror divergence guard", () => {
       "mirror: delivered by actions",
     );
 
-    // What the OIDC exchange mints: an agent carrying the mirror scope.
+    // What the OIDC exchange mints: an agent carrying the mirror scope,
+    // scoped to exactly this repo.
     await pushWithHeaders(
       work.repoDir,
-      {
-        "X-Ripgit-Actor-Name": owner,
-        "X-Ripgit-Actor-Scopes": "push,mirror",
-      },
+      mirrorAgentHeaders(`${owner}/mirror`),
       "push",
       "mirror",
       "HEAD:refs/heads/main",

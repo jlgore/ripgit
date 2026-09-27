@@ -1,0 +1,58 @@
+name = "ripgit-auth"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 database for better-auth (users, sessions, orgs, teams, API keys) and
+# ripgit's namespace and grant tables. ripgit binds the same database as
+# DIRECTORY. Create once and fill in the ID:
+#   wrangler d1 create ripgit-directory
+#   wrangler d1 migrations apply ripgit-directory --remote
+[[d1_databases]]
+binding = "AUTH_DB"
+database_name = "ripgit-directory"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# KV: GitHub OIDC JWKS cache, mirror enrollment, short-lived mirror tokens.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "a643f207be5045f49fb9316b227456f5"
+
+# Service binding to the ripgit worker.
+# The service name must match `name` in ripgit's wrangler.toml.
+[[services]]
+binding = "RIPGIT"
+service = "ripgit"
+
+[vars]
+# Public origin of this worker. better-auth builds its OAuth callback from it.
+BETTER_AUTH_URL = "https://ripgit-auth.sharted.workers.dev"
+
+# Comma-separated GitHub logins allowed to create organizations.
+ORG_CREATORS = "jlgore"
+
+# Audience that GitHub Actions OIDC tokens must carry when exchanging for a
+# mirror token. Pin this to THIS deployment's URL. GitHub's default audience is
+# the repo owner's URL, which every service that owner runs shares — a token
+# minted for one of them would otherwise be replayable here.
+OIDC_AUDIENCE = "https://ripgit-auth.sharted.workers.dev"
+
+# Sign-in uses the ripgit GitHub App. Its callback URL must be
+#   {BETTER_AUTH_URL}/api/auth/callback/github
+#   (local dev: http://localhost:8787/api/auth/callback/github)
+# Credentials come from the account's Secrets Store.
+[[secrets_store_secrets]]
+binding = "GITHUB_CLIENT_ID"
+store_id = "7050b29b966246fa8d5620b195bb9c8b"
+secret_name = "ripgit_github_app_client_id"
+
+[[secrets_store_secrets]]
+binding = "GITHUB_CLIENT_SECRET"
+store_id = "7050b29b966246fa8d5620b195bb9c8b"
+secret_name = "ripgit_github_client_secret"
+
+# BETTER_AUTH_SECRET (32+ random bytes) is not in the Secrets Store yet; set it
+# as a Worker secret:
+#   openssl rand -base64 32 | wrangler secret put BETTER_AUTH_SECRET
+# or add it to the store and bind it here like the two above.

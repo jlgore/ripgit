@@ -5,13 +5,16 @@
 //! syntax highlighting in the file viewer.
 
 use crate::{
-    api, diff,
+    api,
+    authz::Role,
+    diff,
     presentation::{self, Action, Hint, NegotiatedRepresentation},
     store,
 };
 use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
 use worker::*;
 
+mod actions;
 mod commit;
 mod home;
 mod log;
@@ -19,6 +22,9 @@ mod search;
 mod settings;
 mod tree_blob;
 
+pub(crate) use actions::{
+    page_actions, page_actions_markdown, page_run, page_run_markdown, LogTail,
+};
 pub(crate) use commit::page_commit;
 pub(crate) use commit::{page_commit_markdown, page_diff_markdown};
 pub(crate) use home::{page_home, page_home_markdown};
@@ -33,16 +39,35 @@ type Url = worker::Url;
 // Layout: shared HTML shell
 // ---------------------------------------------------------------------------
 
+/// Who is looking at a page: their name, if signed in, and their role on the
+/// repo. Pages use the role to decide which controls to show; the routes
+/// behind those controls check it again.
+#[derive(Clone, Copy)]
+pub(crate) struct Viewer<'a> {
+    pub name: Option<&'a str>,
+    pub role: Role,
+}
+
+impl Viewer<'_> {
+    pub fn can_write(&self) -> bool {
+        self.role >= Role::Write
+    }
+
+    pub fn can_admin(&self) -> bool {
+        self.role >= Role::Admin
+    }
+}
+
 pub(crate) fn layout(
     title: &str,
     owner: &str,
     repo_name: &str,
     default_branch: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     content: &str,
 ) -> String {
-    let is_owner = actor_name == Some(owner);
-    let global_auth = match actor_name {
+    let is_owner = viewer.can_admin();
+    let global_auth = match viewer.name {
         Some(name) => format!(
             r#"<a href="/{n}" class="nav-user">{n}</a><a href="/logout" class="nav-signout">Sign out</a>"#,
             n = html_escape(name),
@@ -96,6 +121,7 @@ pub(crate) fn layout(
         <a href="/{owner}/{repo_name}/commits">Commits</a>
         <a href="/{owner}/{repo_name}/issues">Issues</a>
         <a href="/{owner}/{repo_name}/pulls">PRs</a>
+        <a href="/{owner}/{repo_name}/actions">Actions</a>
         {repo_settings_link}
       </nav>
     </div>
@@ -724,11 +750,11 @@ h2 { font-size: 16px; margin-bottom: 12px; }
 
 pub fn page_owner_profile(
     owner: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     url: &Url,
     repos: &[String],
 ) -> Result<Response> {
-    let is_owner = actor_name == Some(owner);
+    let is_owner = viewer.can_admin();
     let host = url.host_str().unwrap_or("your-worker.dev");
     let scheme = url.scheme();
 
@@ -857,12 +883,12 @@ git push origin main</pre>
 
 pub fn page_owner_profile_markdown(
     owner: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     url: &Url,
     repos: &[String],
     selection: &NegotiatedRepresentation,
 ) -> Result<Response> {
-    let is_owner = actor_name == Some(owner);
+    let is_owner = viewer.can_admin();
     let host = url.host_str().unwrap_or("your-worker.dev");
     let scheme = url.scheme();
 

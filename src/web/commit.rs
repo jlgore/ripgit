@@ -63,7 +63,7 @@ fn build_commit_page(
     })
 }
 
-fn render_commit_html(page: &CommitPage, actor_name: Option<&str>) -> String {
+fn render_commit_html(page: &CommitPage, viewer: Viewer<'_>) -> String {
     let mut html = String::new();
     html.push_str(&format!(
         r#"<h1 style="font-size:18px;margin-bottom:4px">{msg}</h1>"#,
@@ -114,7 +114,7 @@ fn render_commit_html(page: &CommitPage, actor_name: Option<&str>) -> String {
         &page.owner,
         &page.repo_name,
         &page.default_branch,
-        actor_name,
+        viewer,
         &html,
     )
 }
@@ -394,10 +394,10 @@ pub fn page_commit(
     owner: &str,
     repo_name: &str,
     hash: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let page = build_commit_page(sql, owner, repo_name, hash)?;
-    html_response(&render_commit_html(&page, actor_name))
+    html_response(&render_commit_html(&page, viewer))
 }
 
 pub fn page_commit_markdown(

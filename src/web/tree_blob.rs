@@ -259,7 +259,7 @@ fn build_blob_page(
 
 fn render_tree_html(
     page: &TreePage,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     sql: &SqlStorage,
 ) -> Result<Response> {
     let mut html = String::new();
@@ -307,7 +307,7 @@ fn render_tree_html(
         &page.owner,
         &page.repo_name,
         &page.ref_name,
-        actor_name,
+        viewer,
         &html,
     ))
 }
@@ -400,7 +400,7 @@ fn render_tree_markdown(page: &TreePage, selection: &NegotiatedRepresentation) -
 
 fn render_blob_html(
     page: &BlobPage,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
     sql: &SqlStorage,
 ) -> Result<Response> {
     let mut html = String::new();
@@ -448,7 +448,7 @@ fn render_blob_html(
         &page.owner,
         &page.repo_name,
         &page.ref_name,
-        actor_name,
+        viewer,
         &html,
     ))
 }
@@ -535,14 +535,14 @@ pub fn page_tree(
     repo_name: &str,
     ref_name: &str,
     path: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let commit_hash = match api::resolve_ref(sql, ref_name)? {
         Some(hash) => hash,
         None => return Response::error("ref not found", 404),
     };
     let page = build_tree_page(sql, owner, repo_name, ref_name, path, commit_hash)?;
-    render_tree_html(&page, actor_name, sql)
+    render_tree_html(&page, viewer, sql)
 }
 
 pub fn page_tree_markdown(
@@ -567,14 +567,14 @@ pub fn page_blob(
     repo_name: &str,
     ref_name: &str,
     path: &str,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let commit_hash = match api::resolve_ref(sql, ref_name)? {
         Some(hash) => hash,
         None => return Response::error("ref not found", 404),
     };
     let page = build_blob_page(sql, owner, repo_name, ref_name, path, commit_hash)?;
-    render_blob_html(&page, actor_name, sql)
+    render_blob_html(&page, viewer, sql)
 }
 
 pub fn page_blob_markdown(

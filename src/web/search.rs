@@ -133,7 +133,7 @@ fn build_search_page(
     })
 }
 
-fn render_search_html(page: &SearchPage, actor_name: Option<&str>) -> String {
+fn render_search_html(page: &SearchPage, viewer: Viewer<'_>) -> String {
     let mut html = String::new();
     html.push_str("<h1>Search</h1>");
 
@@ -253,7 +253,7 @@ fn render_search_html(page: &SearchPage, actor_name: Option<&str>) -> String {
         &page.owner,
         &page.repo_name,
         &page.default_branch,
-        actor_name,
+        viewer,
         &html,
     )
 }
@@ -453,10 +453,10 @@ pub fn page_search(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let page = build_search_page(sql, owner, repo_name, url)?;
-    html_response(&render_search_html(&page, actor_name))
+    html_response(&render_search_html(&page, viewer))
 }
 
 pub fn page_search_markdown(

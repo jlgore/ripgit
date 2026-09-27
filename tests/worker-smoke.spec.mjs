@@ -101,7 +101,7 @@ describe("ripgit core worker", () => {
 
     const body = await response.text();
     expect(body).toContain(`# ${owner}/${repo} settings`);
-    expect(body).toContain("Owner-only repository maintenance page.");
+    expect(body).toContain("Admin-only repository maintenance page.");
     expect(body).toContain("Default branch: `refs/heads/main`");
   });
 });

@@ -1,5 +1,7 @@
 mod api;
 mod artifacts;
+mod authz;
+mod ci;
 mod diff;
 mod git;
 mod issues;
@@ -11,6 +13,7 @@ mod schema;
 mod store;
 mod web;
 
+use crate::authz::{Access, Actor, Role};
 use crate::presentation::{NegotiatedRepresentation, Representation};
 use worker::*;
 
@@ -19,82 +22,81 @@ use worker::*;
 pub const KEYFRAME_INTERVAL: i64 = 50;
 
 // ---------------------------------------------------------------------------
-// Identity from trusted X-Ripgit-Actor-* headers.
-// These are only set by the auth worker (via service binding) and must never
-// be forwarded from the public internet.
+// Access checks. Identity comes from trusted X-Ripgit-Actor-* headers (set only
+// by the auth worker) and the role from X-Ripgit-Role (set only by the Worker
+// entry below); see authz.rs.
 // ---------------------------------------------------------------------------
-
-struct Actor {
-    display_name: String,
-    /// Capabilities granted by the auth worker, e.g. the mirror agent's
-    /// `mirror` scope. Absent for anonymous or legacy callers.
-    scopes: Vec<String>,
-}
-
-fn actor_from_request(req: &Request) -> Option<Actor> {
-    let headers = req.headers();
-    let name = headers.get("X-Ripgit-Actor-Name").ok()??;
-    let scopes = headers
-        .get("X-Ripgit-Actor-Scopes")
-        .ok()
-        .flatten()
-        .map(|raw| {
-            raw.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(Actor {
-        display_name: name,
-        scopes,
-    })
-}
 
 fn actor_scopes(actor: &Option<Actor>) -> Vec<String> {
     actor.as_ref().map(|a| a.scopes.clone()).unwrap_or_default()
 }
 
-/// Returns a deny Response if the actor cannot write to this repo, else None.
-/// Ownership is checked by comparing the actor's display_name to the URL owner.
-fn check_write_access(actor: &Option<Actor>, repo_owner: &str) -> Option<Result<Response>> {
+/// Returns a deny Response unless the caller holds at least `needed`.
+/// Anonymous callers get a 401 so git knows to retry with credentials.
+fn require_role(actor: &Option<Actor>, role: Role, needed: Role) -> Option<Result<Response>> {
+    if role >= needed {
+        return None;
+    }
     match actor {
         None => Some(unauthorized_401()),
-        Some(a) if a.display_name == repo_owner => None,
         Some(_) => Some(Response::error(
-            "Forbidden: you don't own this repository",
+            format!("Forbidden: requires {} access to this repository", needed.as_str()),
             403,
         )),
     }
 }
 
-/// Config key recording whether a repo may be read anonymously.
+/// Config key recording who may read a repo without a role on it.
 const CFG_VISIBILITY: &str = "visibility";
 
-/// Whether this repo is private. Absent config means public, which keeps
-/// repos that predate visibility tracking readable as they were.
-fn is_private(sql: &SqlStorage) -> Result<bool> {
-    Ok(store::get_config(sql, CFG_VISIBILITY)?.as_deref() == Some("private"))
+/// Who may read a repo without an explicit role.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    /// Anyone, including anonymous callers.
+    Public,
+    /// Members of the owning organization.
+    Internal,
+    /// Only callers with a role on the repo.
+    Private,
 }
 
-/// Returns a 404 if the caller may not read this repo, else None.
-///
-/// A private mirror answers as though it does not exist rather than refusing:
-/// the name of a private repo is itself something the upstream keeps back, and
-/// a 403 would confirm it.
-fn check_read_access(
-    sql: &SqlStorage,
-    actor: &Option<Actor>,
-    repo_owner: &str,
-) -> Option<Result<Response>> {
-    match is_private(sql) {
-        Ok(false) => None,
-        Ok(true) => match actor {
-            Some(a) if a.display_name == repo_owner => None,
-            _ => Some(Response::error("Not Found", 404)),
-        },
-        Err(e) => Some(Err(e)),
+impl Visibility {
+    fn as_str(self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Internal => "internal",
+            Visibility::Private => "private",
+        }
     }
+
+    /// Parse a stored or submitted value. Unknown values fail closed.
+    fn parse(s: &str) -> Visibility {
+        match s {
+            "public" => Visibility::Public,
+            "internal" => Visibility::Internal,
+            _ => Visibility::Private,
+        }
+    }
+}
+
+/// This repo's visibility. Absent config means public, which keeps repos that
+/// predate visibility tracking readable as they were.
+fn visibility(sql: &SqlStorage) -> Result<Visibility> {
+    Ok(store::get_config(sql, CFG_VISIBILITY)?
+        .map(|v| Visibility::parse(&v))
+        .unwrap_or(Visibility::Public))
+}
+
+/// The caller's role once visibility is applied: anyone may read a public
+/// repo, org members may read an internal one, and a private repo is readable
+/// only with an explicit role.
+fn visible_role(sql: &SqlStorage, access: Access) -> Result<Role> {
+    let floor = match visibility(sql)? {
+        Visibility::Public => Role::Read,
+        Visibility::Internal if access.org_member => Role::Read,
+        _ => Role::None,
+    };
+    Ok(access.role.max(floor))
 }
 
 /// 401 with WWW-Authenticate so git knows to prompt for / retry with credentials.
@@ -149,9 +151,15 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         || (parts.len() == 2 && !parts[0].is_empty() && parts[1].is_empty());
     if is_owner_page {
         let owner = parts[0];
-        let actor_name = actor_from_request(&req).map(|a| a.display_name);
+        let actor = Actor::from_request(&req);
         let url = req.url()?;
-        let repos = list_repos(&env, owner, actor_name.as_deref() == Some(owner)).await;
+        // Whoever administers the namespace sees its private repos.
+        let access = authz::resolve_access(&env, actor.as_ref(), owner, None).await;
+        let viewer = web::Viewer {
+            name: actor.as_ref().map(|a| a.name.as_str()),
+            role: access.role,
+        };
+        let repos = list_repos(&env, owner, access).await;
         let selection = match negotiate_or_response(
             &req,
             &[Representation::Html, Representation::Markdown],
@@ -162,13 +170,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         };
         return match selection.representation() {
             Representation::Html => finalize_negotiated(
-                web::page_owner_profile(owner, actor_name.as_deref(), &url, &repos),
+                web::page_owner_profile(owner, viewer, &url, &repos),
                 &selection,
             ),
             Representation::Markdown => finalize_negotiated(
                 web::page_owner_profile_markdown(
                     owner,
-                    actor_name.as_deref(),
+                    viewer,
                     &url,
                     &repos,
                     &selection,
@@ -182,6 +190,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // /:owner/:repo/* — dispatched to a DO instance named "{owner}/{repo}".
     if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
         let do_name = format!("{}/{}", parts[0], parts[1]);
+        let actor = Actor::from_request(&req);
+        let access = authz::resolve_access(&env, actor.as_ref(), parts[0], Some(parts[1])).await;
+        // Always overwrite: whatever arrived under these names is not ours.
+        let mut req = req.clone_mut()?;
+        access.apply(req.headers_mut()?)?;
+
         let namespace = env.durable_object("REPOSITORY")?;
         let id = namespace.id_from_name(&do_name)?;
         let stub = id.get_stub()?;
@@ -246,14 +260,22 @@ impl DurableObject for Repository {
 
         // Resolve the caller's identity from trusted headers (set by auth worker).
         // None means anonymous — allowed for reads, denied for writes.
-        let actor = actor_from_request(&req);
-        let actor_name = actor.as_ref().map(|a| a.display_name.as_str());
+        let actor = Actor::from_request(&req);
+        let actor_name = actor.as_ref().map(|a| a.name.as_str());
 
         // Gate reads before dispatch, so every route -- pages, API, and the git
         // protocol alike -- is covered by one check rather than each remembering.
-        if let Some(resp) = check_read_access(&self.sql, &actor, owner) {
-            return resp;
+        // A private repo answers as though it does not exist rather than
+        // refusing: its name is itself something the owner keeps back, and a
+        // 403 would confirm it.
+        let role = visible_role(&self.sql, Access::from_request(&req))?;
+        if role < Role::Read {
+            return Response::error("Not Found", 404);
         }
+        let viewer = web::Viewer {
+            name: actor_name,
+            role,
+        };
 
         match (req.method(), action) {
             // -- Git smart HTTP protocol --
@@ -265,7 +287,7 @@ impl DurableObject for Repository {
                     .unwrap_or_default();
                 match service.as_str() {
                     "git-receive-pack" => {
-                        if let Some(resp) = check_write_access(&actor, owner) {
+                        if let Some(resp) = require_role(&actor, role, Role::Write) {
                             return resp;
                         }
                         // Refuse at advertisement time so git reports the reason
@@ -282,13 +304,14 @@ impl DurableObject for Repository {
                 }
             }
             (Method::Post, "git-receive-pack") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Write) {
                     return resp;
                 }
                 if let Some(reason) = mirror::push_rejection(&self.sql, &actor_scopes(&actor))? {
                     return Response::error(format!("Forbidden: {}", reason), 403);
                 }
                 let body = req.bytes().await?;
+                let refs_before = ci::ref_snapshot(&self.sql)?;
                 let resp = git::handle_receive_pack(&self.sql, &body)?;
                 // On successful push, register the repo in the REGISTRY KV so
                 // the owner profile page can list it. Best-effort: never fail the push.
@@ -297,17 +320,37 @@ impl DurableObject for Repository {
                     // its signed OIDC claim. Absent for ordinary pushes, which
                     // leaves whatever the repo already had.
                     if let Ok(Some(vis)) = req.headers().get("X-Ripgit-Repo-Visibility") {
-                        let vis = if vis == "public" { "public" } else { "private" };
-                        store::set_config(&self.sql, CFG_VISIBILITY, vis)?;
+                        // A mirror's upstream is public or not; GitHub's own
+                        // "internal" means a GitHub org, not this one.
+                        let vis = if vis == "public" {
+                            Visibility::Public
+                        } else {
+                            Visibility::Private
+                        };
+                        store::set_config(&self.sql, CFG_VISIBILITY, vis.as_str())?;
                     }
 
                     // Visibility is mirrored into the registry so the owner
                     // profile can filter without waking every repo to ask.
                     let key = format!("repo:{}/{}", owner, repo_name);
-                    let value = if is_private(&self.sql)? { "private" } else { "public" };
+                    let value = visibility(&self.sql)?.as_str();
                     if let Ok(kv) = self.env.kv("REGISTRY") {
                         if let Ok(builder) = kv.put(&key, value) {
                             let _ = builder.execute().await;
+                        }
+                    }
+
+                    // Start CI for branches that moved. Mirrors do not run CI:
+                    // upstream already did, and a mirror's job is to keep up.
+                    // Best-effort like the registry write; never fail the push.
+                    let is_mirror = actor.as_ref().is_some_and(|a| a.kind == "mirror");
+                    if !is_mirror {
+                        let moved = ci::moved_refs(&refs_before, &ci::ref_snapshot(&self.sql)?);
+                        let pusher = actor_name.unwrap_or("");
+                        if let Err(e) =
+                            ci::trigger_push(&self.env, &self.sql, owner, repo_name, &moved, pusher).await
+                        {
+                            console_error!("ci trigger for {}/{} failed: {}", owner, repo_name, e);
                         }
                     }
                 }
@@ -318,15 +361,53 @@ impl DurableObject for Repository {
                 git::handle_upload_pack(&self.sql, &body)
             }
 
+            // -- Source archive (the tree at a commit, as tar) --
+            (Method::Get, "archive") if parts.len() == 4 && is_hex40(parts[3]) => {
+                match ci::archive(&self.sql, parts[3])? {
+                    Some(tar) => {
+                        let mut resp = Response::from_bytes(tar)?;
+                        let headers = resp.headers_mut();
+                        headers.set("Content-Type", "application/x-tar")?;
+                        headers.set(
+                            "Content-Disposition",
+                            &format!("attachment; filename=\"{}-{}.tar\"", repo_name, &parts[3][..7]),
+                        )?;
+                        Ok(resp)
+                    }
+                    None => Response::error("Not Found", 404),
+                }
+            }
+
+            // -- CI --
+            (Method::Post, "ci") if parts.get(3) == Some(&"report") => {
+                // Only ripgit-ci, and only about the repo its run belongs to.
+                let path = format!("{}/{}", owner, repo_name).to_lowercase();
+                let is_runner = actor.as_ref().is_some_and(|a| {
+                    a.kind == "ci" && a.repo.as_deref().map(str::to_lowercase) == Some(path.clone())
+                });
+                if !is_runner {
+                    return Response::error("Forbidden", 403);
+                }
+                let report: ci::Report = match req.json().await {
+                    Ok(report) => report,
+                    Err(e) => return Response::error(format!("bad report: {}", e), 400),
+                };
+                match ci::apply_report(&self.sql, report)? {
+                    Ok(()) => Response::ok("ok"),
+                    Err(message) => Response::error(message, 400),
+                }
+            }
+            (Method::Get, "actions") => self.handle_actions(&req, &parts, viewer).await,
+
             // -- Artifacts mirror (owner only) --
             (Method::Post, "artifacts") if parts.get(3) == Some(&"link") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.link_artifacts(&mut req).await
             }
             (Method::Post, "artifacts") if parts.get(3) == Some(&"sync") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.sync_artifacts().await
@@ -346,13 +427,13 @@ impl DurableObject for Repository {
 
             // -- Mirror failover (owner only) --
             (Method::Post, "mirror") if parts.get(3) == Some(&"promote") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.promote_mirror().await
             }
             (Method::Post, "mirror") if parts.get(3) == Some(&"demote") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 store::set_config(&self.sql, mirror::CFG_PROMOTED, "0")?;
@@ -372,13 +453,13 @@ impl DurableObject for Repository {
 
             // -- GitHub mirror (owner only) --
             (Method::Post, "mirror") if parts.get(3) == Some(&"link") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.link_github(&mut req, owner, repo_name).await
             }
             (Method::Post, "mirror") if parts.get(3) == Some(&"sync") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.sync_github().await
@@ -386,7 +467,7 @@ impl DurableObject for Repository {
 
             // -- Delete all data (owner only) --
             (Method::Delete, "") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.state.storage().delete_all().await?;
@@ -419,7 +500,7 @@ impl DurableObject for Repository {
                         finalize_negotiated(diff::handle_diff(&self.sql, sha, &url), &selection)
                     }
                     Representation::Html => finalize_negotiated(
-                        web::page_commit(&self.sql, owner, repo_name, sha, actor_name),
+                        web::page_commit(&self.sql, owner, repo_name, sha, viewer),
                         &selection,
                     ),
                     Representation::Markdown => finalize_negotiated(
@@ -451,7 +532,7 @@ impl DurableObject for Repository {
                         finalize_negotiated(api::handle_log(&self.sql, &url), &selection)
                     }
                     Representation::Html => finalize_negotiated(
-                        web::page_log(&self.sql, owner, repo_name, &url, actor_name),
+                        web::page_log(&self.sql, owner, repo_name, &url, viewer),
                         &selection,
                     ),
                     Representation::Markdown => finalize_negotiated(
@@ -479,7 +560,7 @@ impl DurableObject for Repository {
                         finalize_negotiated(api::handle_commit(&self.sql, hash), &selection)
                     }
                     Representation::Html => finalize_negotiated(
-                        web::page_commit(&self.sql, owner, repo_name, hash, actor_name),
+                        web::page_commit(&self.sql, owner, repo_name, hash, viewer),
                         &selection,
                     ),
                     Representation::Markdown => finalize_negotiated(
@@ -508,12 +589,12 @@ impl DurableObject for Repository {
                 };
                 match selection.representation() {
                     Representation::Html => finalize_negotiated(
-                        web::page_home(&self.sql, owner, repo_name, &url, actor_name),
+                        web::page_home(&self.sql, owner, repo_name, &url, viewer),
                         &selection,
                     ),
                     Representation::Markdown => finalize_negotiated(
                         web::page_home_markdown(
-                            &self.sql, owner, repo_name, &url, actor_name, &selection,
+                            &self.sql, owner, repo_name, &url, viewer, &selection,
                         ),
                         &selection,
                     ),
@@ -531,7 +612,7 @@ impl DurableObject for Repository {
                 };
                 match selection.representation() {
                     Representation::Html => finalize_negotiated(
-                        web::page_log(&self.sql, owner, repo_name, &url, actor_name),
+                        web::page_log(&self.sql, owner, repo_name, &url, viewer),
                         &selection,
                     ),
                     Representation::Markdown => finalize_negotiated(
@@ -559,7 +640,7 @@ impl DurableObject for Repository {
                 match selection.representation() {
                     Representation::Html => finalize_negotiated(
                         web::page_tree(
-                            &self.sql, owner, repo_name, ref_name, &sub_path, actor_name,
+                            &self.sql, owner, repo_name, ref_name, &sub_path, viewer,
                         ),
                         &selection,
                     ),
@@ -590,7 +671,7 @@ impl DurableObject for Repository {
                 match selection.representation() {
                     Representation::Html => finalize_negotiated(
                         web::page_blob(
-                            &self.sql, owner, repo_name, ref_name, &sub_path, actor_name,
+                            &self.sql, owner, repo_name, ref_name, &sub_path, viewer,
                         ),
                         &selection,
                     ),
@@ -614,7 +695,7 @@ impl DurableObject for Repository {
                 };
                 match selection.representation() {
                     Representation::Html => finalize_negotiated(
-                        web::page_search(&self.sql, owner, repo_name, &url, actor_name),
+                        web::page_search(&self.sql, owner, repo_name, &url, viewer),
                         &selection,
                     ),
                     Representation::Markdown => finalize_negotiated(
@@ -625,7 +706,7 @@ impl DurableObject for Repository {
                 }
             }
             (Method::Get, "settings") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 let selection = match negotiate_or_response(
@@ -636,20 +717,24 @@ impl DurableObject for Repository {
                     Ok(selection) => selection,
                     Err(resp) => return resp,
                 };
+                let access = authz::load_repo_access(&self.env, owner, repo_name).await?;
+                let vis = visibility(&self.sql)?.as_str();
                 match selection.representation() {
                     Representation::Html => finalize_negotiated(
-                        web::page_settings(&self.sql, owner, repo_name, actor_name),
+                        web::page_settings(&self.sql, owner, repo_name, viewer, vis, &access),
                         &selection,
                     ),
                     Representation::Markdown => finalize_negotiated(
-                        web::page_settings_markdown(&self.sql, owner, repo_name, &selection),
+                        web::page_settings_markdown(
+                            &self.sql, owner, repo_name, vis, &access, &selection,
+                        ),
                         &selection,
                     ),
                     Representation::Json => unreachable!(),
                 }
             }
             (Method::Post, "settings") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 let sub = parts.get(3).copied().unwrap_or("");
@@ -694,17 +779,17 @@ impl DurableObject for Repository {
                     Representation::Html => match (sub, issue_number) {
                         ("", _) => finalize_negotiated(
                             issues_web::page_issues_list(
-                                &self.sql, owner, repo_name, &url, actor_name,
+                                &self.sql, owner, repo_name, &url, viewer,
                             ),
                             &selection,
                         ),
                         ("new", _) => finalize_negotiated(
-                            issues_web::page_new_issue(&self.sql, owner, repo_name, actor_name),
+                            issues_web::page_new_issue(&self.sql, owner, repo_name, viewer),
                             &selection,
                         ),
                         (_, Some(num)) => finalize_negotiated(
                             issues_web::page_issue_detail(
-                                &self.sql, owner, repo_name, num, actor_name,
+                                &self.sql, owner, repo_name, num, viewer,
                             ),
                             &selection,
                         ),
@@ -713,19 +798,19 @@ impl DurableObject for Repository {
                     Representation::Markdown => match (sub, issue_number) {
                         ("", _) => finalize_negotiated(
                             issues_web::page_issues_list_markdown(
-                                &self.sql, owner, repo_name, &url, actor_name, &selection,
+                                &self.sql, owner, repo_name, &url, viewer, &selection,
                             ),
                             &selection,
                         ),
                         ("new", _) => finalize_negotiated(
                             issues_web::page_new_issue_markdown(
-                                &self.sql, owner, repo_name, actor_name, &selection,
+                                &self.sql, owner, repo_name, viewer, &selection,
                             ),
                             &selection,
                         ),
                         (_, Some(num)) => finalize_negotiated(
                             issues_web::page_issue_detail_markdown(
-                                &self.sql, owner, repo_name, num, actor_name, &selection,
+                                &self.sql, owner, repo_name, num, viewer, &selection,
                             ),
                             &selection,
                         ),
@@ -741,7 +826,7 @@ impl DurableObject for Repository {
                 let sub3 = parts.get(3).copied().unwrap_or("");
                 let sub4 = parts.get(4).copied().unwrap_or("");
                 let aname = actor_name.unwrap_or("");
-                self.handle_issue_action(owner, repo_name, sub3, sub4, "issues", aname, &url, req)
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "issues", aname, role, &url, req)
                     .await
             }
 
@@ -773,19 +858,19 @@ impl DurableObject for Repository {
                     Representation::Html => match (sub, pull_number) {
                         ("", _) => finalize_negotiated(
                             issues_web::page_pulls_list(
-                                &self.sql, owner, repo_name, &url, actor_name,
+                                &self.sql, owner, repo_name, &url, viewer,
                             ),
                             &selection,
                         ),
                         ("new", _) => finalize_negotiated(
                             issues_web::page_new_pull(
-                                &self.sql, owner, repo_name, &url, actor_name,
+                                &self.sql, owner, repo_name, &url, viewer,
                             ),
                             &selection,
                         ),
                         (_, Some(num)) => finalize_negotiated(
                             issues_web::page_issue_detail(
-                                &self.sql, owner, repo_name, num, actor_name,
+                                &self.sql, owner, repo_name, num, viewer,
                             ),
                             &selection,
                         ),
@@ -794,19 +879,19 @@ impl DurableObject for Repository {
                     Representation::Markdown => match (sub, pull_number) {
                         ("", _) => finalize_negotiated(
                             issues_web::page_pulls_list_markdown(
-                                &self.sql, owner, repo_name, &url, actor_name, &selection,
+                                &self.sql, owner, repo_name, &url, viewer, &selection,
                             ),
                             &selection,
                         ),
                         ("new", _) => finalize_negotiated(
                             issues_web::page_new_pull_markdown(
-                                &self.sql, owner, repo_name, &url, actor_name, &selection,
+                                &self.sql, owner, repo_name, &url, viewer, &selection,
                             ),
                             &selection,
                         ),
                         (_, Some(num)) => finalize_negotiated(
                             issues_web::page_issue_detail_markdown(
-                                &self.sql, owner, repo_name, num, actor_name, &selection,
+                                &self.sql, owner, repo_name, num, viewer, &selection,
                             ),
                             &selection,
                         ),
@@ -822,13 +907,13 @@ impl DurableObject for Repository {
                 let sub3 = parts.get(3).copied().unwrap_or("");
                 let sub4 = parts.get(4).copied().unwrap_or("");
                 let aname = actor_name.unwrap_or("");
-                self.handle_issue_action(owner, repo_name, sub3, sub4, "pulls", aname, &url, req)
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "pulls", aname, role, &url, req)
                     .await
             }
 
             // -- Admin endpoints (owner only) --
             (Method::Put, "admin") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 let sub = parts.get(3).unwrap_or(&"");
@@ -969,6 +1054,110 @@ impl DurableObject for Repository {
 // ---------------------------------------------------------------------------
 
 impl Repository {
+    /// GET /:owner/:repo/actions[/:n[/logs/:job/:idx]]
+    async fn handle_actions(&self, req: &Request, parts: &[&str], viewer: web::Viewer<'_>) -> Result<Response> {
+        let owner = parts[0];
+        let repo_name = parts[1];
+        let (default_branch, _) = web::resolve_default_branch(&self.sql)?;
+
+        // Raw step log: /actions/:n/logs/:job/:idx
+        if parts.len() == 7 && parts[4] == "logs" {
+            let Ok(number) = parts[3].parse::<i64>() else {
+                return Response::error("Not Found", 404);
+            };
+            let job = urlencoding_decode(parts[5]);
+            let Ok(idx) = parts[6].parse::<i64>() else {
+                return Response::error("Not Found", 404);
+            };
+            let Some(step) = ci::steps(&self.sql, number)?
+                .into_iter()
+                .find(|s| s.job == job && s.idx == idx && !s.log_key.is_empty())
+            else {
+                return Response::error("Not Found", 404);
+            };
+            return match self.read_log(&step.log_key).await? {
+                Some(text) => {
+                    let mut resp = Response::ok(text)?;
+                    resp.headers_mut().set("Content-Type", "text/plain; charset=utf-8")?;
+                    Ok(resp)
+                }
+                None => Response::error("log not available", 404),
+            };
+        }
+
+        let selection = match negotiate_or_response(
+            req,
+            &[Representation::Html, Representation::Markdown],
+            Representation::Html,
+        ) {
+            Ok(selection) => selection,
+            Err(resp) => return resp,
+        };
+
+        match parts.get(3).copied().filter(|s| !s.is_empty()) {
+            None => {
+                let runs = ci::list_runs(&self.sql, 100)?;
+                match selection.representation() {
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_actions_markdown(owner, repo_name, &runs, &selection),
+                        &selection,
+                    ),
+                    _ => finalize_negotiated(
+                        web::page_actions(owner, repo_name, &default_branch, &runs, viewer),
+                        &selection,
+                    ),
+                }
+            }
+            Some(n) => {
+                let Some(run) = n.parse::<i64>().ok().and_then(|n| ci::get_run(&self.sql, n).ok().flatten())
+                else {
+                    return Response::error("Not Found", 404);
+                };
+                let jobs = ci::jobs(&self.sql, run.number)?;
+                let steps = ci::steps(&self.sql, run.number)?;
+                // Show why a step failed without a click: the end of its log.
+                let mut tails = Vec::new();
+                for step in steps
+                    .iter()
+                    .filter(|s| matches!(s.status.as_str(), "failure" | "error") && !s.log_key.is_empty())
+                {
+                    if let Some(text) = self.read_log(&step.log_key).await? {
+                        tails.push(web::LogTail {
+                            job: step.job.clone(),
+                            idx: step.idx,
+                            text: last_lines(&text, 100),
+                        });
+                    }
+                }
+                match selection.representation() {
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_run_markdown(owner, repo_name, &run, &jobs, &steps, &tails, &selection),
+                        &selection,
+                    ),
+                    _ => finalize_negotiated(
+                        web::page_run(owner, repo_name, &default_branch, &run, &jobs, &steps, &tails, viewer),
+                        &selection,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A step log from the CI_LOGS bucket, or None when the bucket is not
+    /// bound or the object is gone (logs expire).
+    async fn read_log(&self, key: &str) -> Result<Option<String>> {
+        let Ok(bucket) = self.env.bucket("CI_LOGS") else {
+            return Ok(None);
+        };
+        match bucket.get(key).execute().await? {
+            Some(object) => match object.body() {
+                Some(body) => Ok(Some(body.text().await?)),
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
     /// Handle POST /:owner/:repo/{issues,pulls}/:sub3/:sub4
     async fn handle_issue_action(
         &self,
@@ -978,6 +1167,7 @@ impl Repository {
         sub4: &str,       // "" | "comment" | "close" | "reopen" | "merge"
         kind_url: &str,   // "issues" | "pulls"
         actor_name: &str, // already validated non-empty by caller
+        role: Role,
         req_url: &Url,    // for building absolute redirect URLs
         mut req: Request,
     ) -> Result<Response> {
@@ -1053,15 +1243,14 @@ impl Repository {
                 issues::create_comment(&self.sql, issue.id, &comment_body, actor_name, actor_name)?;
             }
             "close" => {
-                issues::set_issue_state(&self.sql, number, "closed", actor_name, owner)?;
+                issues::set_issue_state(&self.sql, number, "closed", actor_name, role >= Role::Triage)?;
             }
             "reopen" => {
-                issues::set_issue_state(&self.sql, number, "open", actor_name, owner)?;
+                issues::set_issue_state(&self.sql, number, "open", actor_name, role >= Role::Triage)?;
             }
             "merge" => {
-                // Only repo owner can merge
-                if actor_name != owner {
-                    return Response::error("Forbidden: only the repo owner can merge", 403);
+                if role < Role::Write {
+                    return Response::error("Forbidden: merging requires write access", 403);
                 }
                 let target_branch =
                     issues::get_issue(&self.sql, number)?.and_then(|issue| issue.target_branch);
@@ -1103,6 +1292,57 @@ impl Repository {
         let back = || -> Result<Response> { make_redirect(req_url, &settings_path) };
 
         match action {
+            "visibility" => {
+                let form = issues::parse_form(&req.text().await?);
+                let requested = form.get("visibility").map(String::as_str).unwrap_or("");
+                let vis = Visibility::parse(requested);
+                if vis.as_str() != requested {
+                    return Response::error("visibility must be public, internal, or private", 400);
+                }
+                if vis == Visibility::Internal
+                    && !authz::load_repo_access(&self.env, owner, repo_name).await?.is_org
+                {
+                    return Response::error(
+                        "internal visibility is only available to organization repos",
+                        400,
+                    );
+                }
+                store::set_config(&self.sql, CFG_VISIBILITY, vis.as_str())?;
+                // Keep the owner profile listing in step, as a push would.
+                if let Ok(kv) = self.env.kv("REGISTRY") {
+                    let key = format!("repo:{}/{}", owner, repo_name);
+                    if let Ok(builder) = kv.put(&key, vis.as_str()) {
+                        let _ = builder.execute().await;
+                    }
+                }
+                back()
+            }
+
+            "grant" => {
+                let form = issues::parse_form(&req.text().await?);
+                let field = |name: &str| form.get(name).cloned().unwrap_or_default();
+                match authz::grant(
+                    &self.env,
+                    owner,
+                    repo_name,
+                    &field("kind"),
+                    &field("grantee"),
+                    &field("role"),
+                )
+                .await?
+                {
+                    Ok(()) => back(),
+                    Err(message) => Response::error(message, 400),
+                }
+            }
+
+            "revoke" => {
+                let form = issues::parse_form(&req.text().await?);
+                let field = |name: &str| form.get(name).cloned().unwrap_or_default();
+                authz::revoke(&self.env, owner, repo_name, &field("kind"), &field("id")).await?;
+                back()
+            }
+
             "rebuild-graph" => {
                 self.sql.exec("DELETE FROM commit_graph", None)?;
                 self.sql.exec(
@@ -1502,14 +1742,47 @@ fn pkt_line(buf: &mut Vec<u8>, data: &str) {
 
 /// Check if a string is a 40-character hex SHA-1 hash.
 /// Used to distinguish API calls (by hash) from web UI calls (by ref + path).
+/// The last `n` lines of `text`.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Decode %XX escapes in one URL path segment. Unlike form decoding, `+` is
+/// a literal plus. Invalid escapes pass through; invalid UTF-8 is replaced.
+fn urlencoding_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// List repos registered in the REGISTRY KV for the given owner.
-/// Keys are stored as "repo:{owner}/{repo}".
+/// List the repos registered in the REGISTRY KV for `owner` that the viewer
+/// may see. Keys are "repo:{owner}/{repo}"; values hold the repo's visibility,
+/// mirrored there on push so this page need not wake every repo to ask.
+///
+/// Namespace admins see everything and org members also see internal repos.
+/// A private repo someone was granted access to individually is not listed;
+/// it is still reachable by URL.
+///
 /// Returns an empty list if the KV binding is unavailable or the list fails.
-async fn list_repos(env: &Env, owner: &str, viewer_is_owner: bool) -> Vec<String> {
+async fn list_repos(env: &Env, owner: &str, access: Access) -> Vec<String> {
     let prefix = format!("repo:{}/", owner);
     let kv = match env.kv("REGISTRY") {
         Ok(kv) => kv,
@@ -1522,14 +1795,18 @@ async fn list_repos(env: &Env, owner: &str, viewer_is_owner: bool) -> Vec<String
     let mut repos = Vec::new();
     for key in result.keys {
         let name = key.name[prefix.len()..].to_string();
-        if viewer_is_owner {
+        if access.role >= Role::Admin {
             repos.push(name);
             continue;
         }
-        // Entries written before visibility was tracked hold "1" and are public.
-        match kv.get(&key.name).text().await {
-            Ok(Some(v)) if v == "private" => continue,
-            _ => repos.push(name),
+        let visible = match kv.get(&key.name).text().await {
+            Ok(Some(v)) if v == "private" => false,
+            Ok(Some(v)) if v == "internal" => access.org_member,
+            // "public", and "1" from before visibility was tracked.
+            _ => true,
+        };
+        if visible {
+            repos.push(name);
         }
     }
     repos

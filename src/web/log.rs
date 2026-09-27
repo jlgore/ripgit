@@ -121,7 +121,7 @@ fn render_log_branch_selector(page: &LogPage) -> String {
     html
 }
 
-fn render_log_html(page: &LogPage, actor_name: Option<&str>) -> String {
+fn render_log_html(page: &LogPage, viewer: Viewer<'_>) -> String {
     let mut html = String::new();
     html.push_str(&render_log_branch_selector(page));
     html.push_str(&format!(
@@ -160,7 +160,7 @@ fn render_log_html(page: &LogPage, actor_name: Option<&str>) -> String {
         &page.owner,
         &page.repo_name,
         &page.ref_name,
-        actor_name,
+        viewer,
         &html,
     )
 }
@@ -240,10 +240,10 @@ pub fn page_log(
     owner: &str,
     repo_name: &str,
     url: &Url,
-    actor_name: Option<&str>,
+    viewer: Viewer<'_>,
 ) -> Result<Response> {
     let page = build_log_page(sql, owner, repo_name, url)?;
-    html_response(&render_log_html(&page, actor_name))
+    html_response(&render_log_html(&page, viewer))
 }
 
 pub fn page_log_markdown(

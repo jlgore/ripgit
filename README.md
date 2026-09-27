@@ -12,7 +12,7 @@ git push origin main
 ## Features
 
 - **Standard git remote** — `git push`, `git clone`, `git fetch` with any git client
-- **Auth via Service Binding** — sits behind an auth worker; public read, owner-only write. GitHub OAuth example in `auth/`
+- **Auth via Service Binding** — sits behind the auth worker in `auth/` (better-auth: GitHub sign-in, orgs, teams, API keys); roles per repo, public repos readable by anyone
 - **Agent-first UI** — browsable pages also negotiate `text/markdown` and `text/plain`, with explicit actions and curl-friendly paths
 - **Web UI** — file browser, commit history, diffs, code search, syntax highlighting, branch selector, markdown README, repo settings
 - **Full-text search** — FTS5 over file content and commit messages. Supports `@author:`, `@message:`, `@path:`, `@ext:`, `@content:` query prefixes
@@ -78,7 +78,7 @@ ripgit reads identity from trusted `X-Ripgit-Actor-*` headers, which are only se
 
 ### GitHub OAuth example
 
-`auth/` is a TypeScript Cloudflare Worker that authenticates with GitHub, issues session cookies for browsers and long-lived tokens for agents/scripts, and forwards requests to ripgit via Service Binding. Its landing page and `/settings` also support the same text-mode negotiation for curl-driven agents.
+`auth/` is a TypeScript Cloudflare Worker built on better-auth: GitHub sign-in, browser sessions, organizations and teams, and API keys for agents/scripts. It forwards requests to ripgit via Service Binding; ripgit resolves each caller's role from the shared D1 database. Its landing page and `/settings` also support the same text-mode negotiation for curl-driven agents.
 
 See `auth/README.md` for a focused deploy/setup guide.
 
@@ -140,7 +140,7 @@ Without the auth worker in front, all repos are publicly readable and writable b
 browser / git client / agent
   │
   ▼
-Auth Worker  (auth — optional, recommended)
+Auth Worker  (auth — required for writes)
   │  validates session/token, sets X-Ripgit-Actor-* headers
   │  Service Binding
   ▼

@@ -153,8 +153,9 @@ impl WorkflowEntrypoint for MirrorWorkflow {
 /// Ask one repo's Durable Object to pull from its GitHub upstream.
 ///
 /// The DO owns the SQLite that objects land in, so the sync must run there
-/// rather than in the Workflow. The actor header is the same trusted signal the
-/// auth worker sets; a Workflow in this Worker is inside that trust boundary.
+/// rather than in the Workflow. The actor and role headers are the same trusted
+/// signals the auth worker and Worker entry set; a Workflow in this Worker is
+/// inside that trust boundary, and the sweep acts for the repo's admin.
 async fn sync_one(env: &Env, repo: &str) -> Result<RepoOutcome> {
     let owner = repo
         .split('/')
@@ -164,6 +165,7 @@ async fn sync_one(env: &Env, repo: &str) -> Result<RepoOutcome> {
 
     let headers = Headers::new();
     headers.set("X-Ripgit-Actor-Name", owner)?;
+    headers.set(crate::authz::ROLE_HEADER, crate::authz::Role::Admin.as_str())?;
 
     let mut init = RequestInit::new();
     init.with_method(Method::Post).with_headers(headers);

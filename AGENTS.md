@@ -11,7 +11,7 @@ A self-hosted git server running on Cloudflare Durable Objects. Each repository 
 ```
 src/
   lib.rs        Worker entry point. Routes /:owner/:repo/* to DO, /:owner/ to profile page.
-                Also contains Actor/auth helpers, check_write_access, list_repos (KV query),
+                Also contains require_role/visible_role, list_repos (KV query),
                 handle_issue_action (issue/PR POST handler).
   pack.rs       Git pack file parser (two-pass: index + resolve). ResolveCache (Arc-based,
                 budget-limited). Pack generator for upload-pack.
@@ -24,6 +24,8 @@ src/
   web.rs        Server-rendered HTML for all 9 web pages. layout() is the shared shell.
                 Key helpers are pub(crate): layout(), html_escape(), html_response(),
                 format_time(), render_markdown(), resolve_default_branch(), render_file_diff().
+  authz.rs      Role resolution: Actor/Role types, resolve_role (one D1 query against
+                the DIRECTORY database), X-Ripgit-Role handoff to the DO.
   schema.rs     Schema initialisation (runs in DO::new). All CREATE TABLE/INDEX statements.
   issues.rs     Issues and PR storage + merge logic. CRUD functions, three-way tree merge,
                 BFS merge-base finder, git object serialization (SHA-1 via sha1_smol),
@@ -56,21 +58,37 @@ scripts/
 
 ## Authentication model
 
-The auth worker sets trusted headers before calling ripgit via Service Binding:
+Authentication and authorization are split across the two workers, joined by
+one D1 database (`ripgit-directory`: `AUTH_DB` in the auth worker, `DIRECTORY`
+in ripgit). See `docs/spec-orgs-and-ci.md` for the design.
+
+**Who (auth worker, `auth/`)** — better-auth handles GitHub sign-in, sessions,
+organizations, teams, and API keys. The worker strips every inbound
+`X-Ripgit-*` header, then sets:
 
 ```
-X-Ripgit-Actor-Name     GitHub username (or agent owner's username for agents)
-X-Ripgit-Actor-Id       stable ID: "github:12345" or "agent:uuid"
-X-Ripgit-Actor-Kind     "user" | "agent"
-X-Ripgit-Actor-Scopes   comma-separated: "repo:read,repo:write,admin,..."
-X-Ripgit-Actor-Owner    for agents: the owning user's actorId
+X-Ripgit-Actor-Id       better-auth user.id (empty for mirror agents)
+X-Ripgit-Actor-Name     the user's namespace (lowercased GitHub login)
+X-Ripgit-Actor-Kind     "user" | "agent" (API key) | "mirror" (OIDC token)
+X-Ripgit-Actor-Scopes   comma-separated, e.g. "push,mirror"
+X-Ripgit-Actor-Repo     mirror agents only: the one "owner/repo" they may write
 ```
 
-`actor_from_request()` in `lib.rs` reads these headers. `X-Ripgit-Actor-Name` is what ripgit uses for ownership checks — it must equal the `owner` segment in the URL for writes to be allowed.
+**What (ripgit, `src/authz.rs`)** — the Worker entry resolves the actor's role
+on `owner/repo` with one D1 query (`ripgit_namespaces`, better-auth's `member`
+and `teamMember`, `ripgit_repo_grants`) and passes it to the DO as
+`X-Ripgit-Role` (`none`/`read`/`triage`/`write`/`admin`), always overwriting
+any inbound value. The DO applies visibility (public repos floor at `read`;
+private repos 404 without a role) and gates routes with `require_role`: push
+needs `write`; settings, admin, mirror/Artifacts management, and delete need
+`admin`; issue close/reopen needs the author or `triage`; merge needs `write`.
 
-**Agent tokens** — when an agent token is created, `ownerActorName` (the owner's GitHub username) is stored alongside `actorName` (the token display name). `forwardToRipgit` in the auth worker sets `X-Ripgit-Actor-Name` to `ownerActorName` for agents, not `actorName`. This is critical — without it, `check_write_access` would compare the token name against the repo owner and always fail.
+A user's own namespace makes them `admin` there. An unclaimed namespace grants
+nobody anything. Namespaces are claimed at first sign-in (users) or org
+creation, never renamed, because DO names are permanent.
 
-The auth worker is optional. If no actor headers are present, all reads are allowed and all writes return 401.
+Internal callers that reach the DO without going through the Worker entry (the
+mirror sweep in `mirror.rs`) set `X-Ripgit-Role` themselves.
 
 ## Storage model
 
@@ -130,7 +148,7 @@ Symbol-heavy queries (containing `.`, `_`, `(`, `:`) bypass FTS5 and use `INSTR`
 
 **DO handler** (`lib.rs::Repository::fetch`):
 - Parses `owner = parts[0]`, `repo_name = parts[1]`, `action = parts[2]`
-- Calls `actor_from_request(&req)` early — actor is passed to all handlers
+- Reads `Actor::from_request` and `Role::from_request` early; the role is checked with `require_role`
 - Git protocol: `info/refs`, `git-receive-pack`, `git-upload-pack`
 - JSON API: `refs`, `file`, `search`, `stats`, `log`, `commit`, `tree`, `blob`, `diff`, `compare`
 - Web UI: `""` (home), `commits`, `log` (alias), `tree`, `blob`, `raw`, `search-ui`, `settings`

@@ -6,6 +6,15 @@ workers_dev = false
 # Repo registry — tracks which repos exist per owner so the profile page
 # can list them. Populated on first successful push.
 # Create with: wrangler kv namespace create REGISTRY
+# Shared with the auth worker (bound there as AUTH_DB): better-auth's users,
+# orgs, and teams, plus ripgit's namespaces and repo grants. Read on every
+# repo request to resolve the caller's role (src/authz.rs). Migrations live in
+# auth/migrations and are applied from the auth worker.
+[[d1_databases]]
+binding = "DIRECTORY"
+database_name = "ripgit-directory"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
 [[kv_namespaces]]
 binding = "REGISTRY"
 id = "b80650158bf14ea6852df7a0302f6e10"

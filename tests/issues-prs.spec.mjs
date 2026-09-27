@@ -151,7 +151,7 @@ describe("issues and pull requests", () => {
       headers: actorHeaders(contributor),
     });
     expect(response.status).toBe(403);
-    expect(await response.text()).toContain("only the repo owner can merge");
+    expect(await response.text()).toContain("merging requires write access");
 
     response = await server.dispatch(`/${owner}/${repo}/pulls/1/merge`, {
       method: "POST",

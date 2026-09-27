@@ -1,5 +1,6 @@
 mod api;
 mod artifacts;
+mod authz;
 mod diff;
 mod git;
 mod issues;
@@ -11,6 +12,7 @@ mod schema;
 mod store;
 mod web;
 
+use crate::authz::{Actor, Role};
 use crate::presentation::{NegotiatedRepresentation, Representation};
 use worker::*;
 
@@ -19,50 +21,25 @@ use worker::*;
 pub const KEYFRAME_INTERVAL: i64 = 50;
 
 // ---------------------------------------------------------------------------
-// Identity from trusted X-Ripgit-Actor-* headers.
-// These are only set by the auth worker (via service binding) and must never
-// be forwarded from the public internet.
+// Access checks. Identity comes from trusted X-Ripgit-Actor-* headers (set only
+// by the auth worker) and the role from X-Ripgit-Role (set only by the Worker
+// entry below); see authz.rs.
 // ---------------------------------------------------------------------------
-
-struct Actor {
-    display_name: String,
-    /// Capabilities granted by the auth worker, e.g. the mirror agent's
-    /// `mirror` scope. Absent for anonymous or legacy callers.
-    scopes: Vec<String>,
-}
-
-fn actor_from_request(req: &Request) -> Option<Actor> {
-    let headers = req.headers();
-    let name = headers.get("X-Ripgit-Actor-Name").ok()??;
-    let scopes = headers
-        .get("X-Ripgit-Actor-Scopes")
-        .ok()
-        .flatten()
-        .map(|raw| {
-            raw.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(Actor {
-        display_name: name,
-        scopes,
-    })
-}
 
 fn actor_scopes(actor: &Option<Actor>) -> Vec<String> {
     actor.as_ref().map(|a| a.scopes.clone()).unwrap_or_default()
 }
 
-/// Returns a deny Response if the actor cannot write to this repo, else None.
-/// Ownership is checked by comparing the actor's display_name to the URL owner.
-fn check_write_access(actor: &Option<Actor>, repo_owner: &str) -> Option<Result<Response>> {
+/// Returns a deny Response unless the caller holds at least `needed`.
+/// Anonymous callers get a 401 so git knows to retry with credentials.
+fn require_role(actor: &Option<Actor>, role: Role, needed: Role) -> Option<Result<Response>> {
+    if role >= needed {
+        return None;
+    }
     match actor {
         None => Some(unauthorized_401()),
-        Some(a) if a.display_name == repo_owner => None,
         Some(_) => Some(Response::error(
-            "Forbidden: you don't own this repository",
+            format!("Forbidden: requires {} access to this repository", needed.as_str()),
             403,
         )),
     }
@@ -77,24 +54,10 @@ fn is_private(sql: &SqlStorage) -> Result<bool> {
     Ok(store::get_config(sql, CFG_VISIBILITY)?.as_deref() == Some("private"))
 }
 
-/// Returns a 404 if the caller may not read this repo, else None.
-///
-/// A private mirror answers as though it does not exist rather than refusing:
-/// the name of a private repo is itself something the upstream keeps back, and
-/// a 403 would confirm it.
-fn check_read_access(
-    sql: &SqlStorage,
-    actor: &Option<Actor>,
-    repo_owner: &str,
-) -> Option<Result<Response>> {
-    match is_private(sql) {
-        Ok(false) => None,
-        Ok(true) => match actor {
-            Some(a) if a.display_name == repo_owner => None,
-            _ => Some(Response::error("Not Found", 404)),
-        },
-        Err(e) => Some(Err(e)),
-    }
+/// The caller's role once visibility is applied: anyone may read a public repo.
+/// A private repo is readable only with an explicit role.
+fn visible_role(sql: &SqlStorage, role: Role) -> Result<Role> {
+    Ok(if is_private(sql)? { role } else { role.max(Role::Read) })
 }
 
 /// 401 with WWW-Authenticate so git knows to prompt for / retry with credentials.
@@ -149,9 +112,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         || (parts.len() == 2 && !parts[0].is_empty() && parts[1].is_empty());
     if is_owner_page {
         let owner = parts[0];
-        let actor_name = actor_from_request(&req).map(|a| a.display_name);
+        let actor = Actor::from_request(&req);
+        let actor_name = actor.as_ref().map(|a| a.name.clone());
         let url = req.url()?;
-        let repos = list_repos(&env, owner, actor_name.as_deref() == Some(owner)).await;
+        // Whoever administers the namespace sees its private repos.
+        let viewer_is_owner =
+            authz::resolve_role(&env, actor.as_ref(), owner, None).await == Role::Admin;
+        let repos = list_repos(&env, owner, viewer_is_owner).await;
         let selection = match negotiate_or_response(
             &req,
             &[Representation::Html, Representation::Markdown],
@@ -182,6 +149,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // /:owner/:repo/* — dispatched to a DO instance named "{owner}/{repo}".
     if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
         let do_name = format!("{}/{}", parts[0], parts[1]);
+        let actor = Actor::from_request(&req);
+        let role = authz::resolve_role(&env, actor.as_ref(), parts[0], Some(parts[1])).await;
+        // Always overwrite: whatever arrived under this name is not ours.
+        let mut req = req.clone_mut()?;
+        req.headers_mut()?.set(authz::ROLE_HEADER, role.as_str())?;
+
         let namespace = env.durable_object("REPOSITORY")?;
         let id = namespace.id_from_name(&do_name)?;
         let stub = id.get_stub()?;
@@ -246,13 +219,17 @@ impl DurableObject for Repository {
 
         // Resolve the caller's identity from trusted headers (set by auth worker).
         // None means anonymous — allowed for reads, denied for writes.
-        let actor = actor_from_request(&req);
-        let actor_name = actor.as_ref().map(|a| a.display_name.as_str());
+        let actor = Actor::from_request(&req);
+        let actor_name = actor.as_ref().map(|a| a.name.as_str());
 
         // Gate reads before dispatch, so every route -- pages, API, and the git
         // protocol alike -- is covered by one check rather than each remembering.
-        if let Some(resp) = check_read_access(&self.sql, &actor, owner) {
-            return resp;
+        // A private repo answers as though it does not exist rather than
+        // refusing: its name is itself something the owner keeps back, and a
+        // 403 would confirm it.
+        let role = visible_role(&self.sql, Role::from_request(&req))?;
+        if role < Role::Read {
+            return Response::error("Not Found", 404);
         }
 
         match (req.method(), action) {
@@ -265,7 +242,7 @@ impl DurableObject for Repository {
                     .unwrap_or_default();
                 match service.as_str() {
                     "git-receive-pack" => {
-                        if let Some(resp) = check_write_access(&actor, owner) {
+                        if let Some(resp) = require_role(&actor, role, Role::Write) {
                             return resp;
                         }
                         // Refuse at advertisement time so git reports the reason
@@ -282,7 +259,7 @@ impl DurableObject for Repository {
                 }
             }
             (Method::Post, "git-receive-pack") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Write) {
                     return resp;
                 }
                 if let Some(reason) = mirror::push_rejection(&self.sql, &actor_scopes(&actor))? {
@@ -320,13 +297,13 @@ impl DurableObject for Repository {
 
             // -- Artifacts mirror (owner only) --
             (Method::Post, "artifacts") if parts.get(3) == Some(&"link") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.link_artifacts(&mut req).await
             }
             (Method::Post, "artifacts") if parts.get(3) == Some(&"sync") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.sync_artifacts().await
@@ -346,13 +323,13 @@ impl DurableObject for Repository {
 
             // -- Mirror failover (owner only) --
             (Method::Post, "mirror") if parts.get(3) == Some(&"promote") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.promote_mirror().await
             }
             (Method::Post, "mirror") if parts.get(3) == Some(&"demote") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 store::set_config(&self.sql, mirror::CFG_PROMOTED, "0")?;
@@ -372,13 +349,13 @@ impl DurableObject for Repository {
 
             // -- GitHub mirror (owner only) --
             (Method::Post, "mirror") if parts.get(3) == Some(&"link") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.link_github(&mut req, owner, repo_name).await
             }
             (Method::Post, "mirror") if parts.get(3) == Some(&"sync") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.sync_github().await
@@ -386,7 +363,7 @@ impl DurableObject for Repository {
 
             // -- Delete all data (owner only) --
             (Method::Delete, "") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 self.state.storage().delete_all().await?;
@@ -625,7 +602,7 @@ impl DurableObject for Repository {
                 }
             }
             (Method::Get, "settings") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 let selection = match negotiate_or_response(
@@ -649,7 +626,7 @@ impl DurableObject for Repository {
                 }
             }
             (Method::Post, "settings") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 let sub = parts.get(3).copied().unwrap_or("");
@@ -741,7 +718,7 @@ impl DurableObject for Repository {
                 let sub3 = parts.get(3).copied().unwrap_or("");
                 let sub4 = parts.get(4).copied().unwrap_or("");
                 let aname = actor_name.unwrap_or("");
-                self.handle_issue_action(owner, repo_name, sub3, sub4, "issues", aname, &url, req)
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "issues", aname, role, &url, req)
                     .await
             }
 
@@ -822,13 +799,13 @@ impl DurableObject for Repository {
                 let sub3 = parts.get(3).copied().unwrap_or("");
                 let sub4 = parts.get(4).copied().unwrap_or("");
                 let aname = actor_name.unwrap_or("");
-                self.handle_issue_action(owner, repo_name, sub3, sub4, "pulls", aname, &url, req)
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "pulls", aname, role, &url, req)
                     .await
             }
 
             // -- Admin endpoints (owner only) --
             (Method::Put, "admin") => {
-                if let Some(resp) = check_write_access(&actor, owner) {
+                if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
                 let sub = parts.get(3).unwrap_or(&"");
@@ -978,6 +955,7 @@ impl Repository {
         sub4: &str,       // "" | "comment" | "close" | "reopen" | "merge"
         kind_url: &str,   // "issues" | "pulls"
         actor_name: &str, // already validated non-empty by caller
+        role: Role,
         req_url: &Url,    // for building absolute redirect URLs
         mut req: Request,
     ) -> Result<Response> {
@@ -1053,15 +1031,14 @@ impl Repository {
                 issues::create_comment(&self.sql, issue.id, &comment_body, actor_name, actor_name)?;
             }
             "close" => {
-                issues::set_issue_state(&self.sql, number, "closed", actor_name, owner)?;
+                issues::set_issue_state(&self.sql, number, "closed", actor_name, role >= Role::Triage)?;
             }
             "reopen" => {
-                issues::set_issue_state(&self.sql, number, "open", actor_name, owner)?;
+                issues::set_issue_state(&self.sql, number, "open", actor_name, role >= Role::Triage)?;
             }
             "merge" => {
-                // Only repo owner can merge
-                if actor_name != owner {
-                    return Response::error("Forbidden: only the repo owner can merge", 403);
+                if role < Role::Write {
+                    return Response::error("Forbidden: merging requires write access", 403);
                 }
                 let target_branch =
                     issues::get_issue(&self.sql, number)?.and_then(|issue| issue.target_branch);

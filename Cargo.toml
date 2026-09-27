@@ -8,7 +8,7 @@ authors = ["Steve James <sjames@cloudflare.com>"]
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = { git = "https://github.com/jlgore/workers-rs", rev = "afed3da" }
+worker = { git = "https://github.com/jlgore/workers-rs", rev = "afed3da", features = ["d1"] }
 worker-macros = { git = "https://github.com/jlgore/workers-rs", rev = "afed3da" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

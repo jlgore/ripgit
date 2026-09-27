@@ -295,7 +295,7 @@ pub fn set_issue_state(
     number: i64,
     new_state: &str,
     actor_name: &str,
-    repo_owner: &str,
+    can_triage: bool,
 ) -> Result<()> {
     let issue = get_issue(sql, number)?
         .ok_or_else(|| Error::RustError(format!("issue #{} not found", number)))?;
@@ -305,9 +305,9 @@ pub fn set_issue_state(
         return Err(Error::RustError("invalid state".into()));
     }
 
-    if actor_name != issue.author_name && actor_name != repo_owner {
+    if actor_name != issue.author_name && !can_triage {
         return Err(Error::RustError(
-            "only the author or repo owner can change issue state".into(),
+            "only the author or someone with triage access can change issue state".into(),
         ));
     }
 

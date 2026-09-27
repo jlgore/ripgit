@@ -63,7 +63,8 @@ one D1 database (`ripgit-directory`: `AUTH_DB` in the auth worker, `DIRECTORY`
 in ripgit). See `docs/spec-orgs-and-ci.md` for the design.
 
 **Who (auth worker, `auth/`)** — better-auth handles GitHub sign-in, sessions,
-organizations, teams, and API keys. The worker strips every inbound
+organizations, teams, and API keys. Org management pages live at `/orgs/...`
+in the auth worker (`auth/src/orgs.ts`), never `/:org/...`, which is ripgit's. The worker strips every inbound
 `X-Ripgit-*` header, then sets:
 
 ```
@@ -77,11 +78,17 @@ X-Ripgit-Actor-Repo     mirror agents only: the one "owner/repo" they may write
 **What (ripgit, `src/authz.rs`)** — the Worker entry resolves the actor's role
 on `owner/repo` with one D1 query (`ripgit_namespaces`, better-auth's `member`
 and `teamMember`, `ripgit_repo_grants`) and passes it to the DO as
-`X-Ripgit-Role` (`none`/`read`/`triage`/`write`/`admin`), always overwriting
-any inbound value. The DO applies visibility (public repos floor at `read`;
-private repos 404 without a role) and gates routes with `require_role`: push
-needs `write`; settings, admin, mirror/Artifacts management, and delete need
-`admin`; issue close/reopen needs the author or `triage`; merge needs `write`.
+`X-Ripgit-Role` (`none`/`read`/`triage`/`write`/`admin`) plus
+`X-Ripgit-Org-Member` (`1`/`0`), always overwriting any inbound values. The DO
+applies visibility (`public` floors everyone at `read`; `internal` floors org
+members at `read`; `private` 404s without a role) and gates routes with
+`require_role`: push needs `write`; settings (including visibility and repo
+grants), admin, mirror/Artifacts management, and delete need `admin`; issue
+close/reopen needs the author or `triage`; merge needs `write`.
+
+Pages receive a `web::Viewer { name, role }` rather than the actor's name, and
+show controls by role (`viewer.can_admin()`, `viewer.can_write()`), matching
+the routes. Never compare the viewer's name to the URL owner to decide access.
 
 A user's own namespace makes them `admin` there. An unclaimed namespace grants
 nobody anything. Namespaces are claimed at first sign-in (users) or org

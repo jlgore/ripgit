@@ -16,6 +16,7 @@ the same database to decide what that actor may do (`src/authz.rs`).
 - `POST /settings/tokens` - create an API key (shown once)
 - `POST /settings/tokens/:id/revoke` - revoke an API key
 - `POST /oidc/github/exchange` - trade a GitHub Actions OIDC token for a short-lived, repo-scoped push token
+- `GET /orgs`, `/orgs/:slug` - organizations: create one, add members by GitHub login, manage teams, set the default repo role (see `src/orgs.ts` for every route)
 
 Everything else is forwarded to ripgit.
 
@@ -23,6 +24,11 @@ On first sign-in a user claims the owner namespace matching their GitHub login
 (`ripgit_namespaces`). Organizations claim their slug when created, from the
 same pool, so a user and an org can never share a name, and a slug can never
 change. Only logins listed in `ORG_CREATORS` may create organizations.
+
+Org members get the org's default repo role (`read` unless changed) on every
+org repo; owners and admins get `admin`. Grant a team or a person more on one
+repo from that repo's settings page. Repos can be `public`, `private`, or (for
+org repos) `internal`: readable by org members only.
 
 API keys are sent as `Authorization: Bearer KEY` or as the password of an
 HTTPS git remote (the username is ignored).

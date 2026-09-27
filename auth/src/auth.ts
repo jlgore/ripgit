@@ -120,7 +120,8 @@ export function authOptions(
     },
     plugins: [
       organization({
-        teams: { enabled: true },
+        // Teams are created deliberately, not one per org by default.
+        teams: { enabled: true, defaultTeam: { enabled: false } },
         allowUserToCreateOrganization: (user) =>
           orgCreators(env).has(normalizeName(String(user.login ?? ""))),
         organizationHooks: {

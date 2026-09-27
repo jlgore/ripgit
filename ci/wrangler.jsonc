@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ripgit-ci",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // Reached only through ripgit's CI service binding.
+  "workers_dev": false,
+  "observability": { "enabled": true },
+
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      // Builds need real memory; `lite` is too small for cargo.
+      "instance_type": "standard-2",
+      // Caps concurrent sandboxes, and so concurrent jobs, across all repos.
+      "max_instances": 4
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "class_name": "Sandbox", "name": "Sandbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sandbox"] }],
+
+  "workflows": [
+    { "name": "ripgit-ci-run", "binding": "CI_RUN", "class_name": "CiRunWorkflow" }
+  ],
+
+  "services": [{ "binding": "RIPGIT", "service": "ripgit" }],
+
+  // Shared with ripgit, which serves logs on its Actions pages.
+  //   wrangler r2 bucket create ripgit-ci-logs
+  "r2_buckets": [{ "binding": "CI_LOGS", "bucket_name": "ripgit-ci-logs" }]
+}

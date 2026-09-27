@@ -1203,7 +1203,7 @@ fn index_file_for_fts(sql: &SqlStorage, path: &str, blob_hash: &str) -> Result<(
 }
 
 /// Get the tree hash for a commit.
-fn commit_tree_hash(sql: &SqlStorage, commit_hash: &str) -> Result<Option<String>> {
+pub(crate) fn commit_tree_hash(sql: &SqlStorage, commit_hash: &str) -> Result<Option<String>> {
     #[derive(serde::Deserialize)]
     struct Row {
         tree_hash: String,

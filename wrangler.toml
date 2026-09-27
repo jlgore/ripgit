@@ -15,6 +15,18 @@ binding = "DIRECTORY"
 database_name = "ripgit-directory"
 database_id = "REPLACE_WITH_D1_DATABASE_ID"
 
+# CI (see ci/ and src/ci.rs). ripgit starts runs through the CI service and
+# reads step logs from CI_LOGS; both are optional -- without CI bound, pushes
+# start no runs. Create the bucket once:
+#   wrangler r2 bucket create ripgit-ci-logs
+[[services]]
+binding = "CI"
+service = "ripgit-ci"
+
+[[r2_buckets]]
+binding = "CI_LOGS"
+bucket_name = "ripgit-ci-logs"
+
 [[kv_namespaces]]
 binding = "REGISTRY"
 id = "b80650158bf14ea6852df7a0302f6e10"

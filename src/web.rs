@@ -14,6 +14,7 @@ use crate::{
 use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
 use worker::*;
 
+mod actions;
 mod commit;
 mod home;
 mod log;
@@ -21,6 +22,9 @@ mod search;
 mod settings;
 mod tree_blob;
 
+pub(crate) use actions::{
+    page_actions, page_actions_markdown, page_run, page_run_markdown, LogTail,
+};
 pub(crate) use commit::page_commit;
 pub(crate) use commit::{page_commit_markdown, page_diff_markdown};
 pub(crate) use home::{page_home, page_home_markdown};
@@ -117,6 +121,7 @@ pub(crate) fn layout(
         <a href="/{owner}/{repo_name}/commits">Commits</a>
         <a href="/{owner}/{repo_name}/issues">Issues</a>
         <a href="/{owner}/{repo_name}/pulls">PRs</a>
+        <a href="/{owner}/{repo_name}/actions">Actions</a>
         {repo_settings_link}
       </nav>
     </div>

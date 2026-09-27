@@ -98,9 +98,9 @@ pub struct Actor {
     /// The actor's own namespace (lowercased GitHub login). Used for display
     /// and as the author name on issues and comments.
     pub name: String,
-    /// "user" | "agent" | "mirror"
+    /// "user" | "agent" | "mirror" | "ci"
     pub kind: String,
-    /// Mirror agents only: the one "owner/repo" they may push to.
+    /// Mirror agents and ripgit-ci only: the one "owner/repo" they act on.
     pub repo: Option<String>,
     /// Capabilities granted by the auth worker, e.g. the mirror agent's
     /// `mirror` scope.
@@ -186,6 +186,18 @@ pub async fn resolve_access(
     if actor.kind == "mirror" {
         let role = match &actor.repo {
             Some(scope) if !path.is_empty() && scope.to_lowercase() == path => Role::Write,
+            _ => Role::None,
+        };
+        return Access {
+            role,
+            org_member: false,
+        };
+    }
+    // ripgit-ci reads the one repo a run belongs to (its archive, for the
+    // runner). Reporting run status is checked separately on that route.
+    if actor.kind == "ci" {
+        let role = match &actor.repo {
+            Some(scope) if !path.is_empty() && scope.to_lowercase() == path => Role::Read,
             _ => Role::None,
         };
         return Access {

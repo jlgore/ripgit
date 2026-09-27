@@ -10,15 +10,15 @@ const migrationsDir = resolve(rootDir, "auth/migrations");
 
 // Stands in for the auth worker in front of ripgit. Like a first GitHub
 // sign-in, the first request from a user claims their namespace, so tests can
-// keep sending plain X-Ripgit-Actor-Name headers. Mirror agents are not users
-// and claim nothing. It deliberately does not strip X-Ripgit-* headers: ripgit
+// keep sending plain X-Ripgit-Actor-Name headers. Mirror agents and ripgit-ci
+// are not users and claim nothing. It deliberately does not strip X-Ripgit-* headers: ripgit
 // must not trust a role header that arrives from outside, and tests check that.
 const gatewayScript = `
 export default {
   async fetch(request, env) {
     const name = request.headers.get("X-Ripgit-Actor-Name");
     const kind = request.headers.get("X-Ripgit-Actor-Kind") ?? "user";
-    if (name && kind !== "mirror") {
+    if (name && (kind === "user" || kind === "agent")) {
       const headers = new Headers(request.headers);
       let id = headers.get("X-Ripgit-Actor-Id");
       if (!id) {
@@ -31,6 +31,23 @@ export default {
       request = new Request(request, { headers });
     }
     return env.RIPGIT.fetch(request);
+  },
+};
+`;
+
+// Stands in for ripgit-ci: records every run ripgit asks it to start, and
+// hands them back on GET /started. Set FAIL to make it refuse runs.
+const ciStubScript = `
+const started = [];
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/runs") {
+      started.push(await request.json());
+      return env.FAIL === "1" ? new Response("no capacity", { status: 503 }) : new Response("started", { status: 202 });
+    }
+    if (url.pathname === "/started") return Response.json(started);
+    return new Response("not found", { status: 404 });
   },
 };
 `;
@@ -63,6 +80,12 @@ function miniflareOptions() {
         serviceBindings: { RIPGIT: "ripgit" },
       },
       {
+        name: "ci",
+        modules: true,
+        script: ciStubScript,
+        compatibilityDate: "2026-03-18",
+      },
+      {
         name: "ripgit",
         scriptPath,
         compatibilityDate: "2026-03-18",
@@ -72,6 +95,8 @@ function miniflareOptions() {
         ],
         kvNamespaces: ["REGISTRY"],
         d1Databases: { DIRECTORY: "directory" },
+        r2Buckets: ["CI_LOGS"],
+        serviceBindings: { CI: "ci" },
         // Credential the GitHub pull mirror authenticates with. The upstream in
         // tests is another ripgit repo, which ignores Authorization entirely —
         // but it must be set for the sync path to run at all.
@@ -98,6 +123,13 @@ export async function createTestServer() {
     url,
     /** The DIRECTORY D1 database, for seeding orgs, teams, and grants. */
     db,
+    /** The CI_LOGS bucket runners write step logs to. */
+    logs: await mf.getR2Bucket("CI_LOGS", "ripgit"),
+    /** Runs ripgit asked the stub CI service to start, in order. */
+    async startedRuns() {
+      const ci = await mf.getWorker("ci");
+      return (await ci.fetch("https://ci.internal/started")).json();
+    },
     dispatch(path = "/", init) {
       return mf.dispatchFetch(new URL(path, url).toString(), init);
     },
@@ -108,6 +140,16 @@ export async function createTestServer() {
 export function actorHeaders(actorName, headers = {}) {
   return {
     "X-Ripgit-Actor-Name": actorName,
+    ...headers,
+  };
+}
+
+/** Headers ripgit-ci sends when acting on `repo`. */
+export function ciHeaders(repo, headers = {}) {
+  return {
+    "X-Ripgit-Actor-Name": "ripgit-ci",
+    "X-Ripgit-Actor-Kind": "ci",
+    "X-Ripgit-Actor-Repo": repo,
     ...headers,
   };
 }

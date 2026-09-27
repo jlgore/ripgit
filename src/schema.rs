@@ -232,4 +232,61 @@ pub fn init(sql: &SqlStorage) {
         None,
     )
     .expect("create idx_issue_comments_issue");
+
+    // CI: one run per pipeline file per push. Absent values are stored as ''
+    // or 0, never NULL (DO SQLite cannot bind NULL parameters; see AGENTS.md).
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS ci_runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            number      INTEGER NOT NULL UNIQUE,
+            pipeline    TEXT NOT NULL,
+            name        TEXT NOT NULL DEFAULT '',
+            event       TEXT NOT NULL,
+            ref         TEXT NOT NULL,
+            sha         TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            actor       TEXT NOT NULL,
+            error       TEXT NOT NULL DEFAULT '',
+            created_at  INTEGER NOT NULL,
+            finished_at INTEGER NOT NULL DEFAULT 0
+        )",
+        None,
+    )
+    .expect("create ci_runs");
+
+    sql.exec(
+        "CREATE INDEX IF NOT EXISTS idx_ci_runs_sha ON ci_runs(sha)",
+        None,
+    )
+    .expect("create idx_ci_runs_sha");
+
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS ci_jobs (
+            run_id      INTEGER NOT NULL,
+            name        TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            started_at  INTEGER NOT NULL DEFAULT 0,
+            finished_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (run_id, name)
+        )",
+        None,
+    )
+    .expect("create ci_jobs");
+
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS ci_steps (
+            run_id      INTEGER NOT NULL,
+            job         TEXT NOT NULL,
+            idx         INTEGER NOT NULL,
+            name        TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            exit_code   INTEGER NOT NULL DEFAULT -1,
+            log_key     TEXT NOT NULL DEFAULT '',
+            started_at  INTEGER NOT NULL DEFAULT 0,
+            finished_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (run_id, job, idx)
+        )",
+        None,
+    )
+    .expect("create ci_steps");
 }

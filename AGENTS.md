@@ -26,6 +26,8 @@ src/
                 format_time(), render_markdown(), resolve_default_branch(), render_file_diff().
   authz.rs      Role resolution: Actor/Role types, resolve_role (one D1 query against
                 the DIRECTORY database), X-Ripgit-Role handoff to the DO.
+  ci.rs         CI runs: pipeline discovery, source archive (tar), run/job/step tables,
+                reports from ripgit-ci, trigger_push after receive-pack.
   schema.rs     Schema initialisation (runs in DO::new). All CREATE TABLE/INDEX statements.
   issues.rs     Issues and PR storage + merge logic. CRUD functions, three-way tree merge,
                 BFS merge-base finder, git object serialization (SHA-1 via sha1_smol),
@@ -41,6 +43,19 @@ auth/
 scripts/
   push-test.sh  Incremental push script for large repos. Splits packs at 30 MB.
 ```
+
+## CI
+
+Pipelines are `.ripgit/pipelines/*.ts` files. After a successful
+`git-receive-pack`, the DO diffs ref snapshots and, for each moved branch,
+creates a run per pipeline file (`ci::trigger_push`) and POSTs it to the `CI`
+service binding (the `ripgit-ci` Worker in `ci/`). ripgit-ci plans and runs it
+in Sandboxes, fetching `GET archive/:sha` and posting `POST ci/report` back as
+the `ci` actor scoped to that repo. Mirror pushes start no runs; without `CI`
+bound, nothing starts. Runs, jobs, and steps live in the repo DO (`ci_runs`,
+`ci_jobs`, `ci_steps`, keyed by run number); step logs live in R2 (`CI_LOGS`).
+Pages: `/actions`, `/actions/:n`, `/actions/:n/logs/:job/:idx`. See
+`ci/README.md`.
 
 ## Key constraints
 

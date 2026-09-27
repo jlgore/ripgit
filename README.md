@@ -12,6 +12,7 @@ git push origin main
 ## Features
 
 - **Standard git remote** — `git push`, `git clone`, `git fetch` with any git client
+- **CI** — `.ripgit/pipelines/*.ts` run on push in Cloudflare Sandboxes via the `ripgit-ci` Worker (`ci/`); results under each repo's Actions tab
 - **Auth via Service Binding** — sits behind the auth worker in `auth/` (better-auth: GitHub sign-in, orgs, teams, API keys); roles per repo, public repos readable by anyone
 - **Agent-first UI** — browsable pages also negotiate `text/markdown` and `text/plain`, with explicit actions and curl-friendly paths
 - **Web UI** — file browser, commit history, diffs, code search, syntax highlighting, branch selector, markdown README, repo settings

@@ -38,6 +38,58 @@ pub const CFG_BINDING: &str = "artifacts_binding";
 /// Default binding name, matching wrangler.toml.
 pub const DEFAULT_BINDING: &str = "ARTIFACTS";
 
+/// The binding exposes the entire deployment namespace, not one user's repos.
+pub async fn can_manage(env: &Env, actor: Option<&crate::authz::Actor>) -> Result<bool> {
+    let Some(actor) = actor else { return Ok(false) };
+    let listed = actor.kind == "user"
+        && !actor.id.is_empty()
+        && !actor.name.is_empty()
+        && env.var("ARTIFACTS_ADMINS")
+            .map(|value| value.to_string().split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case(&actor.name)))
+            .unwrap_or(false);
+    if !listed { return Ok(false); }
+    // GitHub logins can be recycled. Require ownership of the permanent ripgit
+    // namespace as well, so a new GitHub account cannot inherit operator access.
+    Ok(env.d1("DIRECTORY")?
+        .prepare("SELECT name FROM ripgit_namespaces WHERE name = ?1 AND kind = 'user' AND user_id = ?2")
+        .bind(&[actor.name.clone().into(), actor.id.clone().into()])?
+        .first::<serde_json::Value>(None).await?.is_some())
+}
+
+pub async fn list_namespace(req: &Request, env: &Env) -> Result<Response> {
+    if !can_manage(env, crate::authz::Actor::from_request(req).as_ref()).await? {
+        return Response::error("Artifacts management is restricted to deployment operators", 403);
+    }
+    if req.method() != Method::Get {
+        return Response::error("Method not allowed", 405);
+    }
+    let mut options = worker::ArtifactsListOptions::new().limit(50);
+    if let Some((_, cursor)) = req.url()?.query_pairs().find(|(key, _)| key == "cursor") {
+        options = options.cursor(cursor.to_string());
+    }
+    let page = env.artifacts(DEFAULT_BINDING)?.list_with_options(&options).await?;
+    let actor = crate::authz::Actor::from_request(req).unwrap();
+    let kv = env.kv("REGISTRY")?;
+    let mut listing = kv.list().prefix(format!("artifact-link:{}/", actor.name)).limit(100);
+    if let Some((_, cursor)) = req.url()?.query_pairs().find(|(key, _)| key == "links_cursor") {
+        listing = listing.cursor(cursor.to_string());
+    }
+    let keys = listing.execute().await?;
+    let mut links = Vec::new();
+    for key in keys.keys {
+        if let Some(value) = kv.get(&key.name).json::<serde_json::Value>().await? {
+            links.push(value);
+        }
+    }
+    let mut response = Response::from_json(&serde_json::json!({
+        "repos": page.repos, "cursor": page.cursor, "total": page.total,
+        "links": links, "links_cursor": keys.cursor,
+    }))?;
+    response.headers_mut().set("Cache-Control", "private, no-store")?;
+    Ok(response)
+}
+
 /// Lifetime of a minted sync token. Long enough for a large clone, short
 /// enough that the credential is worthless by the time it could leak.
 const TOKEN_TTL_SECS: u32 = 900;

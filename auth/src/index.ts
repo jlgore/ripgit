@@ -22,6 +22,7 @@
 
 import { createAuth, resolveUserLogin, type Auth } from "./auth";
 import { handleOrgs } from "./orgs";
+import { handleArtifacts } from "./artifacts";
 import type { Actor, Env } from "./types";
 import {
   authFooterHtml,
@@ -89,6 +90,10 @@ async function mainHandler(request: Request, env: Env): Promise<Response> {
 
   const orgResponse = await handleOrgs(request, env, auth, actor, pageFormat);
   if (orgResponse) return orgResponse;
+
+  if (url.pathname === "/settings/artifacts") {
+    return handleArtifacts(request, actor, (req) => forwardToRipgit(req, actor, env));
+  }
 
   if (url.pathname === "/settings") {
     if (!actor || actor.kind === "mirror") {
@@ -268,7 +273,7 @@ git push origin main</pre>
 
   return renderAuthPageHtml({
     title: "Settings",
-    topbarRight: `<a href="/orgs">Organizations</a><span>·</span><a href="/${encodeURIComponent(actorName)}/">Profile</a><span>·</span><strong>${escapeHtml(actorName)}</strong><span>·</span><a href="/logout">Sign out</a>`,
+    topbarRight: `<a href="/settings/artifacts">Artifacts</a><span>·</span><a href="/orgs">Organizations</a><span>·</span><a href="/${encodeURIComponent(actorName)}/">Profile</a><span>·</span><strong>${escapeHtml(actorName)}</strong><span>·</span><a href="/logout">Sign out</a>`,
     mainClass: "site-shell",
     footer: authFooterHtml(),
     content: `

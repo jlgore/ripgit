@@ -68,7 +68,7 @@ function migrationStatements() {
     );
 }
 
-function miniflareOptions() {
+function miniflareOptions({ artifacts = false } = {}) {
   return {
     workers: [
       {
@@ -79,6 +79,23 @@ function miniflareOptions() {
         d1Databases: { DIRECTORY: "directory" },
         serviceBindings: { RIPGIT: "ripgit" },
       },
+      ...(artifacts ? [{
+        name: "artifacts-stub", modules: true, compatibilityDate: "2026-03-18",
+        script: `
+          import { WorkerEntrypoint, RpcTarget } from 'cloudflare:workers';
+          const info = name => ({ id: name, name, defaultBranch: 'main', createdAt: '', updatedAt: '', readOnly: false, status: 'ready' });
+          class Repo extends RpcTarget {
+            constructor(name) { super(); this.name = name; }
+            info() { return { ...info(this.name), remote: 'https://artifact-upstream.test/repo.git' }; }
+            createToken() { return { id: 'test-token', plaintext: 'art_test', scope: 'read', expiresAt: '2099-01-01' }; }
+          }
+          export default class extends WorkerEntrypoint {
+            list(options) { return { repos: [info(options?.cursor ? 'second' : 'starter')], total: 2, cursor: options?.cursor ? undefined : 'page-2' }; }
+            get(name) { return new Repo(name); }
+            import(params) { return { ...info(params.target.name), remote: 'https://artifact-upstream.test/repo.git', token: 'secret-not-for-browser' }; }
+          }
+        `,
+      }] : []),
       {
         name: "ci",
         modules: true,
@@ -96,11 +113,12 @@ function miniflareOptions() {
         kvNamespaces: ["REGISTRY"],
         d1Databases: { DIRECTORY: "directory" },
         r2Buckets: ["CI_LOGS"],
-        serviceBindings: { CI: "ci" },
+        serviceBindings: { CI: "ci", ...(artifacts ? { ARTIFACTS: "artifacts-stub" } : {}) },
+        ...(artifacts ? { outboundService: () => new Response('001e# service=git-upload-pack\n00000000') } : {}),
         // Credential the GitHub pull mirror authenticates with. The upstream in
         // tests is another ripgit repo, which ignores Authorization entirely —
         // but it must be set for the sync path to run at all.
-        bindings: { GITHUB_MIRROR_TOKEN: "test-mirror-token" },
+        bindings: { GITHUB_MIRROR_TOKEN: "test-mirror-token", ...(artifacts ? { ARTIFACTS_ADMINS: "alice" } : {}) },
         durableObjects: {
           REPOSITORY: {
             className: "Repository",
@@ -112,8 +130,8 @@ function miniflareOptions() {
   };
 }
 
-export async function createTestServer() {
-  const mf = new Miniflare(miniflareOptions());
+export async function createTestServer(options) {
+  const mf = new Miniflare(miniflareOptions(options));
   const url = await mf.ready;
   const db = await mf.getD1Database("DIRECTORY", "ripgit");
   await db.batch(migrationStatements().map((sql) => db.prepare(sql)));

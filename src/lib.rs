@@ -138,11 +138,21 @@ fn finalize_negotiated(
 // Worker entry point — route to the named Repository DO
 // ---------------------------------------------------------------------------
 
+fn artifacts_same_origin(req: &Request) -> Result<bool> {
+    // Browser forms send Origin. Non-browser authenticated API callers may omit it.
+    let origin = req.url()?.origin().ascii_serialization();
+    Ok(req.headers().get("Origin")?.map(|value| value == origin).unwrap_or(true))
+}
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
     let path = url.path();
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    if path == "/api/artifacts" {
+        return artifacts::list_namespace(&req, &env).await;
+    }
 
     // /:owner/ — user profile page (parts = ["owner", ""] with trailing slash,
     // or parts = ["owner"] without). Handled at the Worker level since there
@@ -404,13 +414,25 @@ impl DurableObject for Repository {
                 if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
+                if !artifacts::can_manage(&self.env, actor.as_ref()).await? {
+                    return Response::error("Artifacts management is restricted to deployment operators", 403);
+                }
+                if !artifacts_same_origin(&req)? { return Response::error("Invalid origin", 403); }
                 self.link_artifacts(&mut req).await
             }
             (Method::Post, "artifacts") if parts.get(3) == Some(&"sync") => {
                 if let Some(resp) = require_role(&actor, role, Role::Admin) {
                     return resp;
                 }
-                self.sync_artifacts().await
+                if !artifacts::can_manage(&self.env, actor.as_ref()).await? {
+                    return Response::error("Artifacts management is restricted to deployment operators", 403);
+                }
+                if !artifacts_same_origin(&req)? { return Response::error("Invalid origin", 403); }
+                let response = self.sync_artifacts().await?;
+                if response.status_code() < 400 {
+                    self.register_artifact(owner, repo_name).await?;
+                }
+                Ok(response)
             }
             (Method::Get, "artifacts") => {
                 let repo = store::get_config(&self.sql, artifacts::CFG_REPO)?;
@@ -1481,7 +1503,15 @@ impl Repository {
             binding: Option<String>,
         }
 
-        let body: LinkBody = req.json().await.unwrap_or_default();
+        let body: LinkBody = match req.json().await {
+            Ok(body) => body,
+            Err(_) => return Response::error("Invalid JSON", 400),
+        };
+        // Linking must never replace a populated repo or an existing upstream.
+        if mirror::is_mirrored(&self.sql)?
+            || !self.sql.exec("SELECT 1 FROM refs LIMIT 1", None)?.to_array::<serde_json::Value>()?.is_empty() {
+            return Response::error("This repository already contains data or has an upstream. Choose a new local name, or sync the existing link.", 409);
+        }
         let binding = body
             .binding
             .unwrap_or_else(|| artifacts::DEFAULT_BINDING.to_string());
@@ -1500,6 +1530,7 @@ impl Repository {
         // already taken, a namespace the account cannot reach. Propagating them
         // as Err would collapse all of that into a bare 500.
         let linked_name = if let Some(repo) = body.repo {
+            self.env.artifacts(&binding)?.get(&repo).await?.info().await?;
             repo
         } else if let Some(name) = body.create {
             match artifacts::create_repo(&self.env, &binding, &name).await {
@@ -1507,7 +1538,7 @@ impl Repository {
                 Err(e) => return Response::error(format!("artifacts create failed: {}", e), 502),
             }
         } else if let Some(source) = body.import {
-            let target = body.name.unwrap_or(own_name);
+            let target = body.name.unwrap_or_else(|| own_name.clone());
             match artifacts::import_repo(
                 &self.env,
                 &binding,
@@ -1524,6 +1555,9 @@ impl Repository {
             // External repo: no binding to mint through, so the token is stored.
             store::set_config(&self.sql, artifacts::CFG_REMOTE, &remote)?;
             store::set_config(&self.sql, artifacts::CFG_TOKEN, &token)?;
+            store::set_config(&self.sql, CFG_VISIBILITY, "private")?;
+            let owner = url.path().trim_start_matches('/').split('/').next().unwrap_or("");
+            self.register_artifact(owner, &own_name).await?;
             return Response::from_json(&serde_json::json!({
                 "linked": true, "mode": "external", "remote": remote,
             }));
@@ -1534,16 +1568,39 @@ impl Repository {
             );
         };
 
+        // Another request may have populated this DO while the binding call awaited.
+        if mirror::is_mirrored(&self.sql)?
+            || !self.sql.exec("SELECT 1 FROM refs LIMIT 1", None)?.to_array::<serde_json::Value>()?.is_empty() {
+            return Response::error("The destination changed while linking. Choose a new local repository name.", 409);
+        }
         store::set_config(&self.sql, artifacts::CFG_REPO, &linked_name)?;
         store::set_config(&self.sql, artifacts::CFG_BINDING, &binding)?;
+        // Artifacts may contain private code. New links start private.
+        store::set_config(&self.sql, CFG_VISIBILITY, "private")?;
+        let owner = url.path().trim_start_matches('/').split('/').next().unwrap_or("");
+        self.register_artifact(owner, &own_name).await?;
 
         Response::from_json(&serde_json::json!({
             "linked": true, "mode": "bound", "repo": linked_name, "binding": binding,
         }))
     }
 
+    async fn register_artifact(&self, owner: &str, repo: &str) -> Result<()> {
+        let kv = self.env.kv("REGISTRY")?;
+        kv.put(&format!("repo:{owner}/{repo}"), visibility(&self.sql)?.as_str())?.execute().await?;
+        kv.put(&format!("artifact-link:{owner}/{repo}"), serde_json::json!({
+            "local": repo,
+            "repo": store::get_config(&self.sql, artifacts::CFG_REPO)?,
+            "last_sync": store::get_config(&self.sql, artifacts::CFG_LAST_SYNC)?,
+        }).to_string())?.execute().await?;
+        Ok(())
+    }
+
     /// Pull the linked Artifacts remote into local storage.
     async fn sync_artifacts(&self) -> Result<Response> {
+        if mirror::is_promoted(&self.sql)? {
+            return Response::error("This mirror accepts local writes. Reconcile it before syncing the upstream.", 409);
+        }
         let (remote, auth) = match artifacts::resolve_source(&self.env, &self.sql).await {
             Ok(source) => source,
             Err(e) => return Response::error(format!("artifacts not reachable: {}", e), 502),
@@ -1552,6 +1609,9 @@ impl Repository {
             Ok(report) => report,
             Err(e) => return Response::error(format!("artifacts sync failed: {}", e), 502),
         };
+        if !report.errors.is_empty() {
+            return Ok(Response::from_json(&report)?.with_status(502));
+        }
         store::set_config(
             &self.sql,
             artifacts::CFG_LAST_SYNC,

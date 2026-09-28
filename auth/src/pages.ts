@@ -170,10 +170,11 @@ export function renderAuthPageHtml(options: {
   .token-value{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:#fff;border:1px solid #d1d9e0;border-radius:6px;padding:8px 10px;word-break:break-all;margin:10px 0;user-select:all}
   .cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:#f6f8fa;border:1px solid #d1d9e0;border-radius:6px;padding:12px 14px;margin:10px 0;overflow-x:auto;white-space:pre;line-height:1.6}
   .form-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
-  input[type=text]{border:1px solid #d1d9e0;border-radius:6px;padding:8px 12px;font-size:14px;min-width:280px;max-width:100%}
-  input[type=text]:focus{outline:none;border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.1)}
+  input[type=text],input[type=url]{border:1px solid #d1d9e0;border-radius:6px;padding:8px 12px;font-size:14px;min-width:0;width:280px;max-width:100%}
+  input[type=text]:focus,input[type=url]:focus{outline:none;border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.1)}
   .btn{background:#1f883d;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer;font-size:14px}
   .btn:hover{background:#1a7f37}
+  .btn:disabled{opacity:.55;cursor:not-allowed}
   .btn-danger{background:#cf222e;color:#fff;border:none;border-radius:6px;cursor:pointer}
   .btn-sm{padding:6px 12px;font-size:13px}
   .btn-danger:hover{background:#a40e26}

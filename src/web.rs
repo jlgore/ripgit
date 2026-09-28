@@ -820,7 +820,7 @@ git push origin main</pre>
 </div>"#,
         owner = html_escape(owner),
         settings_link = if is_owner {
-            r#"<a href="/settings" class="profile-settings">Settings</a>"#.to_string()
+            r#"<span><a href="/settings/artifacts" class="profile-settings">Artifacts</a> · <a href="/settings" class="profile-settings">Settings</a></span>"#.to_string()
         } else {
             String::new()
         },

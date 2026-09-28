@@ -17,6 +17,8 @@ export default pipeline({
       steps: [
         { name: "unit tests", run: "cargo test --lib" },
         { name: "install test deps", run: "npm ci" },
+        { name: "install auth deps", run: "npm --prefix auth ci" },
+        { name: "check auth", run: "npm --prefix auth run typecheck" },
         { name: "build worker", run: "npm run build:worker" },
         {
           name: "end-to-end",

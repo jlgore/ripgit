@@ -20,7 +20,7 @@
  * Setup: see auth/README.md.
  */
 
-import { createAuth, type Auth } from "./auth";
+import { createAuth, resolveUserLogin, type Auth } from "./auth";
 import { handleOrgs } from "./orgs";
 import type { Actor, Env } from "./types";
 import {
@@ -597,10 +597,7 @@ async function handleLogout(request: Request, auth: Auth): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 async function loadLogin(env: Env, userId: string): Promise<string | null> {
-  const row = await env.AUTH_DB.prepare('SELECT login FROM "user" WHERE id = ?')
-    .bind(userId)
-    .first<{ login: string | null }>();
-  return row?.login ?? null;
+  return resolveUserLogin(env.AUTH_DB, userId);
 }
 
 async function resolveActor(
@@ -630,7 +627,7 @@ async function resolveActor(
   if (!session) return null;
   return {
     userId: session.user.id,
-    login: session.user.login ?? "",
+    login: session.user.login || (await loadLogin(env, session.user.id)) || "",
     kind: "user",
     scopes: USER_SCOPES,
   };

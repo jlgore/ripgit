@@ -51,6 +51,59 @@ export function nameProblem(name: string): string | null {
   return null;
 }
 
+/**
+ * Resolve a permanent namespace from a verified, linked GitHub account.
+ * `login` stays input:false: better-auth also filters mapProfileToUser through
+ * that rule, and allowing generic user updates would let users impersonate a
+ * namespace. Only this server-owned write may fill a missing login.
+ * Existing sessions from before this fix use the same repair path.
+ */
+export async function resolveUserLogin(db: D1Database, userId: string): Promise<string | null> {
+  const user = await db.prepare('SELECT login FROM "user" WHERE id = ?')
+    .bind(userId).first<{ login: string | null }>();
+  if (!user) return null;
+  if (user.login) return user.login;
+
+  // Recover an already-owned name first; a GitHub rename must never rename a DO.
+  const owned = await db.prepare("SELECT name FROM ripgit_namespaces WHERE user_id = ?")
+    .bind(userId).first<{ name: string }>();
+  let login = owned?.name;
+  if (!login) {
+    const account = await db.prepare(
+      'SELECT accountId FROM account WHERE userId = ? AND providerId = ? ORDER BY createdAt, id LIMIT 1',
+    ).bind(userId, "github").first<{ accountId: string }>();
+    if (!account || !/^[0-9]+$/.test(account.accountId)) return null;
+
+    // The ID comes from better-auth's completed OAuth exchange, never a form.
+    // This public endpoint needs no stored OAuth token or extra GitHub scope.
+    const response = await fetch(`https://api.github.com/user/${account.accountId}`, {
+      headers: { "User-Agent": "ripgit", Accept: "application/vnd.github+json" },
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new APIError("SERVICE_UNAVAILABLE", { message: "GitHub account setup is unavailable; try again." });
+    }
+    const profile = await response.json<{ id: number; login: string }>();
+    if (String(profile.id) !== account.accountId || typeof profile.login !== "string") {
+      throw new APIError("BAD_GATEWAY", { message: "GitHub returned an unexpected account." });
+    }
+    login = normalizeName(profile.login);
+    const problem = nameProblem(login);
+    if (problem) throw new APIError("BAD_REQUEST", { message: problem });
+  }
+
+  await db.batch([
+    db.prepare('UPDATE "user" SET login = ? WHERE id = ? AND (login IS NULL OR login = \'\')')
+      .bind(login, userId),
+    // Do not take a namespace already claimed by a different user or org.
+    db.prepare(`INSERT OR IGNORE INTO ripgit_namespaces (name, kind, user_id, created_at)
+      SELECT login, 'user', id, ? FROM "user" WHERE id = ? AND login = ?`)
+      .bind(Date.now(), userId, login),
+  ]);
+  return (await db.prepare('SELECT login FROM "user" WHERE id = ?')
+    .bind(userId).first<{ login: string | null }>())?.login ?? null;
+}
+
 async function namespaceTaken(db: D1Database, name: string): Promise<boolean> {
   const row = await db
     .prepare("SELECT 1 FROM ripgit_namespaces WHERE name = ?")
@@ -93,8 +146,6 @@ export function authOptions(
       github: {
         clientId: env.GITHUB_CLIENT_ID,
         clientSecret: env.GITHUB_CLIENT_SECRET,
-        // Keep the GitHub login: it becomes the user's owner namespace.
-        mapProfileToUser: (profile) => ({ login: normalizeName(profile.login) }),
       },
     },
     user: {
@@ -103,20 +154,12 @@ export function authOptions(
       },
     },
     databaseHooks: {
-      user: {
+      session: {
         create: {
-          // Claim the user's namespace on first sign-in. If the name is
-          // reserved or already taken (by an org, say), the account still
-          // works; the user just owns no namespace until one is assigned.
-          after: async (user) => {
-            const login = (user as { login?: string | null }).login;
-            if (!login || nameProblem(login)) return;
-            await db
-              .prepare(
-                "INSERT OR IGNORE INTO ripgit_namespaces (name, kind, user_id, created_at) VALUES (?, 'user', ?, ?)",
-              )
-              .bind(login, user.id, Date.now())
-              .run();
+          // The linked account exists by session creation, unlike user creation.
+          before: async (session) => {
+            await resolveUserLogin(db, session.userId);
+            return { data: session };
           },
         },
       },
